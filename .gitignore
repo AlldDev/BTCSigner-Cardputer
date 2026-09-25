@@ -1,0 +1,4 @@
+firmware/.pio/
+firmware/lib/trezor-firmware/.git/
+*.o
+*.a
