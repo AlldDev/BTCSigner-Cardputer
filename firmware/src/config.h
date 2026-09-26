@@ -11,6 +11,9 @@ namespace btcseed {
 // segredos sao zerados (BIP-11 do spec).
 constexpr uint32_t kSessionTimeoutMs = 3 * 60 * 1000; // 3 minutos
 
+// Quanto tempo Enter precisa ficar segurado para assinar uma PSBT.
+constexpr uint32_t kHoldToSignMs = 1500;
+
 // --- Mnemonico ---
 constexpr int kMnemonicWordsShort = 12;
 constexpr int kMnemonicWordsLong = 24;
@@ -44,10 +47,23 @@ constexpr uint32_t kChangeInternal = 1;
 // board) nao tem folga para os multiplos buffers do tamanho desse limite
 // que main.cpp e psbt.cpp precisam manter em paralelo (build real medido:
 // 64 KB deixava o firmware em 81% de uso de RAM; com 16 KB cai para ~30%).
-constexpr size_t kMaxPsbtFileSize = 16 * 1024; // 16 KB
+// Subido para 32 KB (~46% de RAM) quando a tx anterior completa
+// (non_witness_utxo) passou a ser obrigatoria: uma tx de origem grande
+// (saque em lote de exchange) nao cabia em 16 KB. Cada KB aqui custa ~3.3 KB
+// de RAM (buf_ do Psbt + scratch de serialize_signed + g_psbt_io_buf).
+constexpr size_t kMaxPsbtFileSize = 32 * 1024; // 32 KB
 constexpr int kMaxPsbtInputs = 20;
 constexpr int kMaxPsbtOutputs = 20;
 constexpr size_t kMaxFilenameLen = 64;
+
+// Teto de valor do consenso (MAX_MONEY). Qualquer valor acima disso num
+// PSBT e malformado — e garante que a soma de ate 20 valores nao estoura.
+constexpr uint64_t kMaxMoneySats = 21000000ull * 100000000ull;
+
+// Troco verificado com indice acima disso ganha aviso na revisao: uma
+// carteira watch-only (gap limit ~20) nunca escanearia um indice absurdo e
+// os fundos ficariam "escondidos". Ajustavel.
+constexpr uint32_t kChangeIndexWarning = 1000;
 
 // --- Aviso de taxa alta ---
 constexpr double kHighFeeWarningPercent = 5.0; // % do valor enviado

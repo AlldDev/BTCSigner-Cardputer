@@ -62,34 +62,37 @@ static void test_receive_and_change_addresses_match_bip84_vector(void) {
   wipe(&mk);
 }
 
-static void test_change_detection_finds_own_change_output(void) {
+static void test_descriptor_checksum_matches_bip380_vector(void) {
+  char sum[9];
+  TEST_ASSERT_TRUE(btcseed::descriptor_checksum("raw(deadbeef)", sum));
+  TEST_ASSERT_EQUAL_STRING("89f8spxm", sum);
+  TEST_ASSERT_FALSE(btcseed::descriptor_checksum("raw(\x01)", sum)); // fora do charset
+}
+
+static void test_descriptor_for_bip84_vector(void) {
   MasterKey mk;
   TEST_ASSERT_TRUE(derive_master_key(kMnemonic, "", Network::kMainnet, &mk));
 
-  // hash160 do endereco de troco m/84'/0'/0'/1/0 (bc1q8c6fshw2dl...), obtido
-  // decodificando o proprio endereco esperado do vetor oficial acima.
-  HDNode change_node;
-  TEST_ASSERT_TRUE(btcseed::derive_child_node(mk, 1, 0, &change_node));
+  char desc[200];
+  TEST_ASSERT_TRUE(btcseed::build_descriptor(mk, btcseed::kChangeExternal, desc, sizeof(desc)));
+  // xpub padrao da conta m/84'/0'/0' do mnemonic "abandon ... about" — mesma
+  // chave do zpub oficial do BIP84, so com a versao BIP32 padrao.
+  TEST_ASSERT_EQUAL_STRING_LEN(
+      "wpkh([73c5da0a/84h/0h/0h]xpub6CatWdiZiodmUeTDp8LT5or8nmbKNcuyvz7WyksVFkKB4RHwCD3Xy"
+      "uvPEbvqAQY3rAPshWcMLoP2fMFMKHPJ4ZeZXYVUhLv1VMrjPC7PW6V/0/*)#",
+      desc, strlen(desc) - 8);
 
-  uint32_t found_index = 0xffffffff;
-  uint8_t pubkeyhash[20];
-  // Reconstroi o hash160 via derive_address + segwit_addr_decode round-trip
-  // seria redundante; em vez disso reusa find_change_index com o proprio
-  // hash160 derivado (equivalente ao que psbt.cpp fara a partir do PSBT).
-  TEST_ASSERT_EQUAL_INT(0, hdnode_fill_public_key(&change_node));
-  ecdsa_get_pubkeyhash(change_node.public_key, change_node.curve->hasher_pubkey,
-                       pubkeyhash);
-  btcseed::wipe_node(&change_node);
+  const char *hash = strchr(desc, '#');
+  TEST_ASSERT_NOT_NULL(hash);
+  char body[200];
+  memcpy(body, desc, hash - desc);
+  body[hash - desc] = '\0';
+  char sum[9];
+  TEST_ASSERT_TRUE(btcseed::descriptor_checksum(body, sum));
+  TEST_ASSERT_EQUAL_STRING(sum, hash + 1);
 
-  TEST_ASSERT_TRUE(
-      btcseed::find_change_index(mk, pubkeyhash, 5, &found_index));
-  TEST_ASSERT_EQUAL_UINT32(0, found_index);
-
-  // Um hash160 que nao pertence a esta seed nao deve ser encontrado.
-  uint8_t bogus[20];
-  memset(bogus, 0xAB, sizeof(bogus));
-  TEST_ASSERT_FALSE(btcseed::find_change_index(mk, bogus, 5, &found_index));
-
+  // Buffer pequeno demais: falha em vez de truncar.
+  TEST_ASSERT_FALSE(btcseed::build_descriptor(mk, btcseed::kChangeInternal, desc, 100));
   wipe(&mk);
 }
 
@@ -99,6 +102,7 @@ int main(int argc, char **argv) {
   UNITY_BEGIN();
   RUN_TEST(test_account_xpub_matches_bip84_vector);
   RUN_TEST(test_receive_and_change_addresses_match_bip84_vector);
-  RUN_TEST(test_change_detection_finds_own_change_output);
+  RUN_TEST(test_descriptor_checksum_matches_bip380_vector);
+  RUN_TEST(test_descriptor_for_bip84_vector);
   return UNITY_END();
 }

@@ -96,6 +96,56 @@ Fixture make_fixture() {
   return f;
 }
 
+// Como a tx anterior (PSBT_IN_NON_WITNESS_UTXO) entra no PSBT de teste.
+enum class PrevTx {
+  kNormal,       // legado, bate com o witness_utxo
+  kSegwit,       // serializacao BIP144 (marker/flag/witness), mesmo txid
+  kMissing,      // campo ausente
+  kWrongAmount,  // prev-tx paga 100001, witness_utxo alega 100000
+  kWrongTxid,    // outpoint aponta para outro txid
+  kTrailingJunk, // byte extra depois do locktime
+};
+
+// Tx anterior com 1 input qualquer e o output 0 = P2WPKH(recv_hash) com
+// `amount`. `txid` e calculado aqui, de forma independente de psbt.cpp,
+// sobre a serializacao sem witness.
+void build_prev_tx(const uint8_t recv_hash[20], uint64_t amount, bool segwit,
+                  Builder *raw, uint8_t txid[32]) {
+  Builder body; // inputs + outputs
+  body.varint(1);
+  uint8_t parent[32];
+  memset(parent, 0x22, sizeof(parent));
+  body.bytes(parent, sizeof(parent));
+  body.u32le(0);
+  body.varint(0);
+  body.u32le(0xffffffff);
+  body.varint(1);
+  body.u64le(amount);
+  body.varint(22);
+  body.u8(0x00);
+  body.u8(0x14);
+  body.bytes(recv_hash, 20);
+
+  Builder stripped;
+  stripped.u32le(2);
+  stripped.bytes(body.data(), body.size());
+  stripped.u32le(0);
+  hasher_Raw(HASHER_SHA2D, stripped.data(), stripped.size(), txid);
+
+  raw->u32le(2);
+  if (segwit) {
+    raw->u8(0x00); // marker
+    raw->u8(0x01); // flag
+  }
+  raw->bytes(body.data(), body.size());
+  if (segwit) {
+    raw->varint(1); // 1 item de witness para o unico input
+    raw->varint(3);
+    raw->bytes((const uint8_t[]){0xde, 0xad, 0x01}, 3);
+  }
+  raw->u32le(0);
+}
+
 // Constroi um PSBT binario com 1 input (nosso, witness_utxo=100000 sats) e
 // 2 outputs: externo (50000 sats, hash arbitrario) e troco de verdade
 // (49000 sats, m/84'/0'/0'/1/0) — fee = 1000 sats.
@@ -107,22 +157,33 @@ Fixture make_fixture() {
 // outro hash (simula troco falsificado).
 void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
                int64_t sighash_value = -1, bool corrupt_change_hash = false,
-               bool use_real_fp = true) {
+               bool use_real_fp = true, uint64_t external_value = 50000,
+               uint32_t input_coin = kCoinTypeMainnet, uint32_t change_index = 0,
+               PrevTx prev_mode = PrevTx::kNormal) {
   uint32_t fingerprint = use_real_fp ? f.mk.master_fingerprint : bip32_fp;
+  uint8_t change_pubkey[33];
+  uint8_t change_hash[20];
+  derive_hash_and_pubkey(f.mk, kChangeInternal, change_index, change_pubkey, change_hash);
+
+  // --- tx anterior (gasta pelo input 0, vout 0) ---
+  Builder prev;
+  uint8_t txid[32];
+  build_prev_tx(f.recv_hash, prev_mode == PrevTx::kWrongAmount ? 100001 : 100000,
+                prev_mode == PrevTx::kSegwit, &prev, txid);
+  if (prev_mode == PrevTx::kWrongTxid) txid[0] ^= 0x01;
+  if (prev_mode == PrevTx::kTrailingJunk) prev.u8(0x00);
 
   // --- unsigned tx ---
   Builder tx;
   tx.u32le(1); // version
   tx.varint(1); // 1 input
-  uint8_t txid[32];
-  memset(txid, 0x11, sizeof(txid));
   tx.bytes(txid, sizeof(txid));
   tx.u32le(0);       // vout
   tx.varint(0);      // scriptSig vazio
   tx.u32le(0xffffffff); // sequence
   tx.varint(2); // 2 outputs
   // output 0: externo
-  tx.u64le(50000);
+  tx.u64le(external_value);
   tx.varint(22);
   tx.u8(0x00);
   tx.u8(0x14);
@@ -139,7 +200,7 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
     memset(bogus, 0xbb, sizeof(bogus));
     tx.bytes(bogus, sizeof(bogus));
   } else {
-    tx.bytes(f.change_hash, sizeof(f.change_hash));
+    tx.bytes(change_hash, sizeof(change_hash));
   }
   tx.u32le(0); // locktime
 
@@ -152,6 +213,12 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
   b->end_map();
 
   // --- input map (1 input) ---
+  if (prev_mode != PrevTx::kMissing) {
+    b->varint(1);
+    b->u8(0x00); // PSBT_IN_NON_WITNESS_UTXO
+    b->varint(prev.size());
+    b->bytes(prev.data(), prev.size());
+  }
   // PSBT_IN_WITNESS_UTXO
   b->varint(1);
   b->u8(0x01);
@@ -170,7 +237,7 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
   b->varint(4 + 5 * 4);
   b->fingerprint_be(fingerprint);
   b->u32le(kPurposeBip84);
-  b->u32le(kCoinTypeMainnet);
+  b->u32le(input_coin);
   b->u32le(kAccountHardened);
   b->u32le(kChangeExternal);
   b->u32le(0);
@@ -188,14 +255,14 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
   // output 1 (troco): PSBT_OUT_BIP32_DERIVATION alegando m/84'/0'/0'/1/0
   b->varint(1 + 33);
   b->u8(0x02);
-  b->bytes(f.change_pubkey, sizeof(f.change_pubkey));
+  b->bytes(change_pubkey, sizeof(change_pubkey));
   b->varint(4 + 5 * 4);
   b->fingerprint_be(f.mk.master_fingerprint);
   b->u32le(kPurposeBip84);
   b->u32le(kCoinTypeMainnet);
   b->u32le(kAccountHardened);
   b->u32le(kChangeInternal);
-  b->u32le(0);
+  b->u32le(change_index);
   b->end_map();
 }
 
@@ -206,7 +273,8 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
 void compute_expected_sighash(const uint8_t recv_hash[20],
                              const uint8_t change_hash[20], uint8_t out[32]) {
   uint8_t txid[32];
-  memset(txid, 0x11, sizeof(txid));
+  Builder prev;
+  build_prev_tx(recv_hash, 100000, false, &prev, txid);
   uint8_t outpoint[36];
   memcpy(outpoint, txid, 32);
   memset(outpoint + 32, 0, 4); // vout = 0
@@ -455,6 +523,82 @@ static void test_forged_change_is_shown_as_external_with_warning(void) {
   TEST_ASSERT_TRUE(summary.outputs[1].claimed_change_invalid);
 }
 
+static PsbtError validate_built(const Fixture &f, const Builder &b, PsbtSummary *summary) {
+  static Psbt psbt; // buffers grandes: fora da stack
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(psbt.load(b.data(), b.size())));
+  return psbt.validate(f.mk, Network::kMainnet, summary);
+}
+
+static void test_value_above_max_money_is_rejected(void) {
+  Fixture f = make_fixture();
+  Builder b;
+  // ~2^63: sem teto, somado ao troco estouraria o uint64 e "balancearia".
+  build_psbt(f, &b, 0, -1, false, true, /*external_value=*/0x8000000000000000ull);
+  PsbtSummary summary;
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kMalformed),
+                       static_cast<int>(validate_built(f, b, &summary)));
+}
+
+static void test_input_coin_type_of_other_network_is_rejected(void) {
+  Fixture f = make_fixture();
+  Builder b;
+  build_psbt(f, &b, 0, -1, false, true, 50000, /*input_coin=*/kCoinTypeTestnet);
+  PsbtSummary summary;
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kNetworkMismatch),
+                       static_cast<int>(validate_built(f, b, &summary)));
+}
+
+static void test_change_with_high_index_is_flagged(void) {
+  Fixture f = make_fixture();
+  PsbtSummary summary;
+  Builder low;
+  build_psbt(f, &low, 0, -1, false, true, 50000, kCoinTypeMainnet, /*change_index=*/0);
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(validate_built(f, low, &summary)));
+  TEST_ASSERT_TRUE(summary.outputs[1].is_change);
+  TEST_ASSERT_FALSE(summary.outputs[1].change_index_high);
+
+  Builder high;
+  build_psbt(f, &high, 0, -1, false, true, 50000, kCoinTypeMainnet, /*change_index=*/5000);
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(validate_built(f, high, &summary)));
+  TEST_ASSERT_TRUE(summary.outputs[1].is_change);
+  TEST_ASSERT_EQUAL_UINT32(5000, summary.outputs[1].change_index);
+  TEST_ASSERT_TRUE(summary.outputs[1].change_index_high);
+}
+
+static PsbtError validate_with_prev(PrevTx mode) {
+  Fixture f = make_fixture();
+  Builder b;
+  build_psbt(f, &b, 0, -1, false, true, 50000, kCoinTypeMainnet, 0, mode);
+  PsbtSummary summary;
+  return validate_built(f, b, &summary);
+}
+
+static void test_missing_non_witness_utxo_is_rejected(void) {
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kMissingNonWitnessUtxo),
+                       static_cast<int>(validate_with_prev(PrevTx::kMissing)));
+}
+
+// O ataque CVE-2020-14199: witness_utxo mente o valor do input.
+static void test_witness_amount_not_matching_prev_tx_is_rejected(void) {
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kPrevTxMismatch),
+                       static_cast<int>(validate_with_prev(PrevTx::kWrongAmount)));
+}
+
+static void test_prev_tx_with_other_txid_is_rejected(void) {
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kPrevTxMismatch),
+                       static_cast<int>(validate_with_prev(PrevTx::kWrongTxid)));
+}
+
+static void test_segwit_prev_tx_is_accepted(void) {
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kNone),
+                       static_cast<int>(validate_with_prev(PrevTx::kSegwit)));
+}
+
+static void test_prev_tx_with_trailing_junk_is_rejected(void) {
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kMalformed),
+                       static_cast<int>(validate_with_prev(PrevTx::kTrailingJunk)));
+}
+
 static void test_truncated_file_is_rejected(void) {
   Fixture f = make_fixture();
   Builder b;
@@ -564,6 +708,14 @@ int main(int argc, char **argv) {
   RUN_TEST(test_wrong_fingerprint_is_rejected);
   RUN_TEST(test_unsupported_sighash_is_rejected);
   RUN_TEST(test_forged_change_is_shown_as_external_with_warning);
+  RUN_TEST(test_value_above_max_money_is_rejected);
+  RUN_TEST(test_input_coin_type_of_other_network_is_rejected);
+  RUN_TEST(test_change_with_high_index_is_flagged);
+  RUN_TEST(test_missing_non_witness_utxo_is_rejected);
+  RUN_TEST(test_witness_amount_not_matching_prev_tx_is_rejected);
+  RUN_TEST(test_prev_tx_with_other_txid_is_rejected);
+  RUN_TEST(test_segwit_prev_tx_is_accepted);
+  RUN_TEST(test_prev_tx_with_trailing_junk_is_rejected);
   RUN_TEST(test_truncated_file_is_rejected);
   RUN_TEST(test_bad_magic_is_rejected);
   RUN_TEST(test_base64_roundtrip_matches_binary);

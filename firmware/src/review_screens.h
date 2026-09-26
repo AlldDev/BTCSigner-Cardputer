@@ -17,6 +17,14 @@ namespace btcseed {
 // capacidade >= strlen(address) + strlen(address)/4 + 1.
 bool format_address_grouped(const char *address, char *out, size_t out_len);
 
+// Quebra de linha para exibir texto (enderecos agrupados, xpub) na tela.
+// Pega a proxima linha de `text` a partir de *pos: pula espacos iniciais,
+// usa ate `max_chars`, preferindo quebrar no ultimo espaco que cabe (corte
+// duro se nao houver). Avanca *pos. Retorna false quando nao ha mais texto.
+// Nunca descarta caractere que nao seja espaco.
+bool wrap_next_line(const char *text, size_t *pos, size_t max_chars, size_t *line_start,
+                    size_t *line_len);
+
 // "0.00050000 BTC" (8 casas decimais fixas, sempre).
 bool format_btc(uint64_t sats, char *out, size_t out_len);
 
@@ -35,6 +43,8 @@ struct OutputReviewText {
   char amount_btc[24] = {0};
   char amount_sats[24] = {0};
   bool is_change = false;
+  uint32_t change_index = 0;
+  bool change_index_high = false;
   bool claimed_change_invalid = false;
 };
 void build_output_review(const OutputInfo &output, OutputReviewText *out);

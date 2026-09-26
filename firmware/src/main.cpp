@@ -2,13 +2,13 @@
 // Composicao pura dos modulos ja testados no host (session, keys,
 // mnemonic_input, passphrase_input, psbt, review_screens, sd_io) com as
 // primitivas de ui.cpp. Nao ha logica criptografica nem de parsing aqui —
-// so orquestracao de tela/estado.
+// so orquestracao de tela/estado. O visual segue o design "Cardputer PSBT
+// Signer" (claude.ai/design), aplicado ao fluxo stateless deste firmware.
 //
 // AVISO: este arquivo depende do hardware (Arduino/M5Cardputer) e por isso
-// nao pode ser compilado nem testado no ambiente `native`. Foi escrito com
-// cuidado a partir dos modulos ja testados, mas o FLUXO DE TELAS em si
-// (textos, paginacao, teclas exatas) ainda nao foi validado visualmente
-// num Cardputer real — ver README.md.
+// nao pode ser compilado nem testado no ambiente `native`. O FLUXO DE TELAS
+// em si (layout, paginacao, teclas exatas) ainda nao foi validado
+// visualmente num Cardputer real — ver README.md.
 #include <Arduino.h>
 
 #include <cstdio>
@@ -41,11 +41,13 @@ enum class State {
   kChecksumFailed,
   kPassphraseEntry,
   kFingerprintConfirm,
-  kMainMenu,
-  kPsbtList,
+  kMainMenu, // abas ASSINAR / CARTEIRA / SESSAO
   kPsbtReviewOutput,
   kPsbtReviewFee,
+  kPsbtConfirm, // segurar Enter para assinar
   kPsbtDone,
+  kError,
+  kXpubChoice,
   kXpubExport,
   kReceiveAddressEntry,
   kReceiveAddressShow,
@@ -65,6 +67,7 @@ uint32_t millis_fn() { return millis(); }
 Session g_session(millis_fn);
 
 State g_state = State::kSelectWordCount;
+bool g_sd_ok = false;
 
 int g_word_count_choice = kMnemonicWordsLong;
 Network g_network_choice = Network::kMainnet;
@@ -73,17 +76,26 @@ MnemonicInput g_mnemonic(kMnemonicWordsLong);
 char g_mnemonic_text[BIP39_MAX_MNEMONIC_LEN + 1] = {0};
 PassphraseInput g_passphrase;
 MasterKey g_pending_mk;
+uint32_t g_last_key_ms = 0; // timeout das telas pre-sessao (ver loop())
 
 int g_correction_index = 0; // usado em kChecksumFailed
 
-int g_menu_index = 0;
-constexpr const char *kMenuItems[] = {
-    "Assinar PSBT",
-    "Exportar xpub",
-    "Ver endereco de recebimento",
-    "Encerrar sessao",
-};
-constexpr int kMenuItemCount = 4;
+// Menu principal em abas.
+enum Tab { kTabSign = 0, kTabWallet, kTabSession, kTabCount };
+constexpr const char *kTabLabels[kTabCount] = {"ASSINAR", "CARTEIRA", "SESSAO"};
+enum WalletRow { kRowFingerprint = 0, kRowNetwork, kRowScript, kRowXpub, kRowReceive,
+                 kWalletRowCount };
+enum SessionRow { kRowBrightness = 0, kRowAutoLock, kRowEndSession, kSessionRowCount };
+enum XpubChoiceRow { kXpubChoiceRaw = 0, kXpubChoiceDownload, kXpubChoiceCount };
+constexpr int kMenuRowH = 20;
+constexpr int kMenuVisibleRows = 4;
+int g_tab = kTabSign;
+int g_row = 0;
+
+constexpr uint8_t kBrightnessLevels[] = {77, 128, 179, 255};
+constexpr int kBrightnessPct[] = {30, 50, 70, 100};
+constexpr int kBrightnessCount = 4;
+int g_brightness_idx = 2; // 70%, igual ao ui_init()
 
 PsbtFileEntry g_psbt_files[kMaxPsbtFilesListed];
 int g_psbt_file_count = 0;
@@ -91,39 +103,74 @@ int g_psbt_file_selected = 0;
 int g_psbt_output_index = 0;
 OutputReviewText g_output_text;
 FeeReviewText g_fee_text;
-char g_status_line[80] = {0};
 
-char g_index_entry[8] = {0}; // "Ver endereco de recebimento": indice digitado
+// Segurar Enter em kPsbtConfirm. `armed` so vira true depois que Enter foi
+// solto uma vez nesta tela — o Enter que veio do resumo nao conta.
+bool g_hold_armed = false;
+bool g_holding = false;
+uint32_t g_hold_start_ms = 0;
+int g_hold_pct = 0;
+
+char g_status_line[80] = {0}; // mensagem transitoria: some na proxima tecla
+char g_signed_name[kMaxFilenameLen + 1] = {0};
+bool g_xpub_saved = false;
+bool g_xpub_write_attempted = false; // true so quando veio de "Baixar arquivo"
+char g_error_title[32] = {0};
+char g_error_msg[48] = {0};
+
+char g_index_entry[8] = {0}; // "Endereco de recebimento": indice digitado
 int g_index_entry_len = 0;
 
-// --- helpers de desenho ------------------------------------------------------
+// --- helpers -----------------------------------------------------------------
 
-// Desenha `text` em uma ou mais linhas de ate `max_chars` caracteres,
-// comecando em `*line` (que e incrementado a cada linha usada). ui.cpp nao
-// quebra texto sozinho — telas com texto longo (enderecos) precisam disso.
-void draw_wrapped(int *line, const char *text, TextStyle style = TextStyle::kNormal,
-                  int max_chars = 38) {
-  size_t len = strlen(text);
-  size_t pos = 0;
-  if (len == 0) {
-    ui_draw_line((*line)++, "", style);
-    return;
-  }
-  while (pos < len) {
-    char chunk[64];
-    size_t n = len - pos;
-    if (n > static_cast<size_t>(max_chars)) n = static_cast<size_t>(max_chars);
-    if (n >= sizeof(chunk)) n = sizeof(chunk) - 1;
-    memcpy(chunk, text + pos, n);
-    chunk[n] = '\0';
-    ui_draw_line((*line)++, chunk, style);
-    pos += n;
+void copy_str(char *dst, size_t dst_len, const char *src) {
+  strncpy(dst, src != nullptr ? src : "", dst_len - 1);
+  dst[dst_len - 1] = '\0';
+}
+
+void set_status(const char *text) { copy_str(g_status_line, sizeof(g_status_line), text); }
+
+void show_error(const char *title, const char *msg) {
+  copy_str(g_error_title, sizeof(g_error_title), title);
+  copy_str(g_error_msg, sizeof(g_error_msg), msg);
+  g_state = State::kError;
+}
+
+// "7a3fc21e" -> "7a3f c21e"
+void format_fingerprint_spaced(uint32_t fingerprint, char out[10]) {
+  char fp[9];
+  format_fingerprint(fingerprint, fp);
+  snprintf(out, 10, "%.4s %.4s", fp, fp + 4);
+}
+
+const char *psbt_error_message(PsbtError e) {
+  switch (e) {
+    case PsbtError::kFingerprintMismatch: return "outra seed ou passphrase?";
+    case PsbtError::kDerivationPathMismatch:
+    case PsbtError::kPubkeyMismatch: return "nenhuma chave desta carteira";
+    case PsbtError::kNetworkMismatch: return "rede diferente da sessao";
+    case PsbtError::kAlreadyHasSignature: return "PSBT ja tem assinatura";
+    case PsbtError::kUnsupportedInputScript:
+    case PsbtError::kUnsupportedOutputScript: return "script nao suportado";
+    case PsbtError::kUnsupportedSighash: return "sighash nao suportado";
+    case PsbtError::kAmountsDontBalance: return "saidas maiores que entradas";
+    case PsbtError::kTooManyInputs:
+    case PsbtError::kTooManyOutputs: return "entradas/saidas demais";
+    case PsbtError::kFileTooLarge: return "arquivo grande demais";
+    case PsbtError::kMissingWitnessUtxo:
+    case PsbtError::kMissingBip32Derivation: return "PSBT sem dados de derivacao";
+    case PsbtError::kMissingNonWitnessUtxo: return "PSBT sem tx anterior (non_witness)";
+    case PsbtError::kPrevTxMismatch: return "valor/script do input nao confere";
+    default: return "arquivo malformado";
   }
 }
 
-void set_status(const char *text) {
-  strncpy(g_status_line, text, sizeof(g_status_line) - 1);
-  g_status_line[sizeof(g_status_line) - 1] = '\0';
+int menu_row_count() {
+  switch (g_tab) {
+    case kTabSign: return g_psbt_file_count;
+    case kTabWallet: return kWalletRowCount;
+    default: return kSessionRowCount;
+  }
 }
 
 void wipe_seed_material() {
@@ -136,275 +183,337 @@ void wipe_seed_material() {
 void go_to_start(const char *reason) {
   wipe_seed_material();
   g_session.end();
-  set_status(reason != nullptr ? reason : "");
+  set_status(reason);
   g_word_count_choice = kMnemonicWordsLong;
   g_network_choice = Network::kMainnet;
   g_state = State::kSelectWordCount;
 }
 
+void refresh_psbt_list() {
+  g_psbt_file_count = list_psbt_files(g_psbt_files, kMaxPsbtFilesListed);
+  g_psbt_file_selected = 0;
+}
+
+void go_to_menu(int tab) {
+  g_tab = tab;
+  g_row = 0;
+  if (tab == kTabSign) refresh_psbt_list();
+  g_state = State::kMainMenu;
+}
+
 // --- render ------------------------------------------------------------------
 
-void render();
+constexpr int kContentW = kScreenW - 2 * kMargin;
+
+void kv_line(int y, const char *label, const char *value, uint16_t value_color = color::kText) {
+  ui_text(kMargin, y, label, color::kMuted, Font::kBody);
+  ui_text(kScreenW - kMargin, y, value, value_color, Font::kBody, Align::kRight);
+}
+
+// Endereco completo e agrupado em kBody. Se por algum motivo nao couber ate o
+// rodape, cai para kSmall (38 chars/linha): nunca corta o endereco.
+int draw_address(int y, const char *grouped) {
+  int end = ui_text_wrapped(kMargin, y, kContentW, grouped, color::kText, Font::kBody, false);
+  Font font = end <= kBodyBottom ? Font::kBody : Font::kSmall;
+  return ui_text_wrapped(kMargin, y, kContentW, grouped, color::kText, font);
+}
 
 void render_select_word_count() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, "BTCSeed-Cardputer");
-  ui_draw_line(line++, "");
-  ui_draw_line(line++, "Numero de palavras da seed:");
-  ui_draw_line(line++,
-              g_word_count_choice == kMnemonicWordsLong ? "> 24 (padrao)"
-                                                        : "  24",
-              g_word_count_choice == kMnemonicWordsLong ? TextStyle::kHighlighted
-                                                        : TextStyle::kNormal);
-  ui_draw_line(line++,
-              g_word_count_choice == kMnemonicWordsShort ? "> 12" : "  12",
-              g_word_count_choice == kMnemonicWordsShort ? TextStyle::kHighlighted
-                                                          : TextStyle::kNormal);
-  ui_draw_line(line++, "");
-  ui_draw_line(line++, "Cima/Baixo: escolhe  Enter: ok", TextStyle::kMuted);
+  ui_begin_screen("SEED", "^v mover", "OK escolher");
+  ui_text(kMargin, 20, "NUMERO DE PALAVRAS DA SEED", color::kMuted);
+  ui_row(31, 24, "24 palavras", "padrao", g_word_count_choice == kMnemonicWordsLong);
+  ui_row(57, 24, "12 palavras", nullptr, g_word_count_choice == kMnemonicWordsShort);
+  if (g_status_line[0] != '\0') ui_text(kMargin, 100, g_status_line, color::kOrange);
 }
 
 void render_select_network() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, "Rede desta sessao:");
-  ui_draw_line(line++,
-              g_network_choice == Network::kMainnet ? "> Mainnet" : "  Mainnet",
-              g_network_choice == Network::kMainnet ? TextStyle::kHighlighted
-                                                    : TextStyle::kNormal);
-  ui_draw_line(line++,
-              g_network_choice == Network::kTestnet ? "> Testnet/Signet"
-                                                    : "  Testnet/Signet",
-              g_network_choice == Network::kTestnet ? TextStyle::kHighlighted
-                                                    : TextStyle::kNormal);
-  ui_draw_line(line++, "");
-  ui_draw_line(line++, "Cima/Baixo: escolhe  Enter: ok", TextStyle::kMuted);
+  ui_begin_screen("REDE", "ESC voltar  ^v mover", "OK escolher");
+  ui_text(kMargin, 20, "REDE DESTA SESSAO", color::kMuted);
+  ui_row(31, 24, "Mainnet", "bc1...", g_network_choice == Network::kMainnet);
+  ui_row(57, 24, "Testnet/Signet", "tb1...", g_network_choice == Network::kTestnet);
 }
 
 void render_mnemonic_entry() {
-  ui_clear();
-  int line = 0;
-  char header[32];
-  snprintf(header, sizeof(header), "Palavra %d/%d",
-          g_mnemonic.current_word_index() + 1, g_mnemonic.word_count());
-  ui_draw_line(line++, header);
-
-  char prefix_line[40];
-  snprintf(prefix_line, sizeof(prefix_line), "> %s", g_mnemonic.current_prefix());
-  ui_draw_line(line++, prefix_line);
+  char title[24];
+  snprintf(title, sizeof(title), "PALAVRA %d/%d", g_mnemonic.current_word_index() + 1,
+           g_mnemonic.word_count());
+  ui_begin_screen(title, "ESC sair DEL apagar ^v", "OK confirmar");
 
   int count = g_mnemonic.count_candidates();
+  ui_input_box(kMargin, 18, kContentW, g_mnemonic.current_prefix(), count == 0);
   if (count == 0) {
-    ui_draw_line(line++, "(nenhuma palavra possivel)", TextStyle::kWarning);
-  } else {
-    int selected = g_mnemonic.selected_candidate_index();
-    constexpr int kWindow = 5;
-    int start = selected - 2;
-    if (start < 0) start = 0;
-    for (int i = 0; i < kWindow && start + i < count; i++) {
-      int idx = start + i;
-      const char *word = g_mnemonic.nth_candidate(idx);
-      TextStyle style =
-          (idx == selected) ? TextStyle::kHighlighted : TextStyle::kNormal;
-      ui_draw_line(line++, word != nullptr ? word : "", style);
-    }
+    ui_text(kMargin, 50, "sem palavra com esse prefixo", color::kError, Font::kBody);
+    return;
   }
-  ui_draw_line(ui_max_lines() - 1,
-              "Enter=ok Bksp=apaga Setas=navega", TextStyle::kMuted);
+  constexpr int kWindow = 4;
+  int selected = g_mnemonic.selected_candidate_index();
+  int start = selected - 1;
+  if (start < 0) start = 0;
+  for (int i = 0; i < kWindow && start + i < count; i++) {
+    int idx = start + i;
+    const char *word = g_mnemonic.nth_candidate(idx);
+    ui_row(45 + i * 19, 18, word != nullptr ? word : "", nullptr, idx == selected);
+  }
 }
 
 void render_checksum_failed() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, "Checksum BIP39 invalido!", TextStyle::kWarning);
-  ui_draw_line(line++, "");
-  char msg[40];
-  snprintf(msg, sizeof(msg), "Corrigir a partir da palavra: %d",
-          g_correction_index + 1);
-  ui_draw_line(line++, msg);
-  ui_draw_line(line++, "");
-  ui_draw_line(line++, "Esq/Dir muda, Enter corrige,", TextStyle::kMuted);
-  ui_draw_line(line++, "^C recomeca do zero", TextStyle::kMuted);
+  ui_begin_screen("ERRO", "ESC recomecar  <> palavra", "OK corrigir");
+  ui_icon_error(kScreenW / 2, 36);
+  ui_text(kScreenW / 2, 54, "Checksum invalido", color::kText, Font::kTitle, Align::kCenter);
+  char msg[32];
+  snprintf(msg, sizeof(msg), "Corrigir palavra < %d >", g_correction_index + 1);
+  ui_text(kScreenW / 2, 78, msg, color::kMuted, Font::kBody, Align::kCenter);
 }
 
 void render_passphrase_entry() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, "Passphrase (25a palavra)");
-  ui_draw_line(line++, "Pode ficar vazia. Enter confirma.", TextStyle::kMuted);
-  ui_draw_line(line++, "");
+  ui_begin_screen("PASSPHRASE", "ESC sair  DEL apagar", "OK continuar");
+  ui_text(kMargin, 24, "PASSPHRASE (25a PALAVRA)", color::kMuted);
   char display[kMaxPassphraseLen + 1];
   g_passphrase.render_display(display, sizeof(display));
-  char line_buf[64];
-  snprintf(line_buf, sizeof(line_buf), "> %s", display);
-  ui_draw_line(line++, line_buf);
-  ui_draw_line(line++, "");
-  ui_draw_line(line++, "Tab: mostrar/ocultar", TextStyle::kMuted);
+  bool failed = g_status_line[0] != '\0';
+  ui_input_box(kMargin, 36, kContentW, display, failed);
+  if (failed) {
+    ui_text(kMargin, 66, g_status_line, color::kError);
+  } else {
+    ui_text(kMargin, 66, "Pode ficar vazia. Tab mostra/oculta.", color::kMuted);
+  }
+  ui_text(kMargin, 78, "Fn+` digita o caractere `", color::kMuted);
 }
 
 void render_fingerprint_confirm() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, "Confira o master fingerprint:");
-  ui_draw_line(line++, "");
-  char fp[9];
-  format_fingerprint(g_pending_mk.master_fingerprint, fp);
-  char fp_line[16];
-  snprintf(fp_line, sizeof(fp_line), "  %s", fp);
-  ui_draw_line(line++, fp_line, TextStyle::kHighlighted);
-  ui_draw_line(line++, "");
-  ui_draw_line(line++, "Bate com o anotado na geracao", TextStyle::kMuted);
-  ui_draw_line(line++, "da seed? Enter=sim ^C=nao", TextStyle::kMuted);
+  ui_begin_screen("FINGERPRINT", "ESC nao", "OK sim");
+  ui_text(kScreenW / 2, 18, "MASTER FINGERPRINT", color::kMuted, Font::kSmall, Align::kCenter);
+  char fp[10];
+  format_fingerprint_spaced(g_pending_mk.master_fingerprint, fp);
+  ui_text(kScreenW / 2, 28, fp, color::kOrange, Font::kBig, Align::kCenter);
+
+  char label[40];
+  snprintf(label, sizeof(label), "ENDERECO #0  m/84'/%d'/0'/0/0",
+           g_network_choice == Network::kMainnet ? 0 : 1);
+  ui_text(kMargin, 50, label, color::kMuted);
+  char addr[74];
+  if (derive_address(g_pending_mk, kChangeExternal, 0, addr, sizeof(addr))) {
+    char grouped[100];
+    format_address_grouped(addr, grouped, sizeof(grouped));
+    draw_address(60, grouped);
+  } else {
+    ui_text(kMargin, 60, "(falha ao derivar)", color::kError, Font::kBody);
+  }
+  ui_text(kScreenW / 2, 100, "Confira com o anotado / Ian Coleman", color::kMuted,
+          Font::kSmall, Align::kCenter);
+}
+
+struct MenuRow {
+  const char *left;
+  const char *right;
+  uint16_t right_color;
+};
+
+void render_menu_rows(int y0, const MenuRow *rows, int n) {
+  int start = g_row >= kMenuVisibleRows ? g_row - kMenuVisibleRows + 1 : 0;
+  for (int i = 0; i < kMenuVisibleRows && start + i < n; i++) {
+    int idx = start + i;
+    ui_row(y0 + i * kMenuRowH, kMenuRowH - 1, rows[idx].left, rows[idx].right,
+           idx == g_row, rows[idx].right_color);
+  }
 }
 
 void render_main_menu() {
-  ui_clear();
-  int line = 0;
-  char fp[9];
-  format_fingerprint(g_session.master_key().master_fingerprint, fp);
-  char header[24];
-  snprintf(header, sizeof(header), "Sessao ativa: %s", fp);
-  ui_draw_line(line++, header, TextStyle::kMuted);
-  ui_draw_line(line++, "");
-  for (int i = 0; i < kMenuItemCount; i++) {
-    char item[40];
-    snprintf(item, sizeof(item), "%s%s", i == g_menu_index ? "> " : "  ",
-            kMenuItems[i]);
-    ui_draw_line(line++, item,
-                i == g_menu_index ? TextStyle::kHighlighted : TextStyle::kNormal);
-  }
-  if (g_status_line[0] != '\0') {
-    ui_draw_line(ui_max_lines() - 1, g_status_line, TextStyle::kMuted);
-  }
-}
+  ui_begin_screen("SIGNER", g_status_line[0] != '\0' ? g_status_line : "<> abas  ^v mover",
+                  "OK abrir");
+  ui_tabs(kBodyTop, kTabLabels, kTabCount, g_tab);
+  int y0 = kBodyTop + kTabsH + 1;
 
-void render_psbt_list() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, "Arquivos .psbt no cartao:");
-  if (g_psbt_file_count == 0) {
-    ui_draw_line(line++, "(nenhum encontrado)", TextStyle::kWarning);
-  } else {
-    for (int i = 0; i < g_psbt_file_count && line < ui_max_lines() - 1; i++) {
-      char item[40];
-      snprintf(item, sizeof(item), "%s%s", i == g_psbt_file_selected ? "> " : "  ",
-              g_psbt_files[i].name);
-      ui_draw_line(line++, item,
-                  i == g_psbt_file_selected ? TextStyle::kHighlighted
-                                            : TextStyle::kNormal);
+  if (g_tab == kTabSign) {
+    if (g_psbt_file_count == 0) {
+      ui_text(kScreenW / 2, 52, "nenhum .psbt no cartao", color::kMuted, Font::kBody,
+              Align::kCenter);
+      ui_text(kScreenW / 2, 74, g_sd_ok ? "coloque em /psbt ou na raiz" : "cartao SD nao montado",
+              g_sd_ok ? color::kMuted : color::kError, Font::kSmall, Align::kCenter);
+      return;
     }
+    MenuRow rows[kMaxPsbtFilesListed];
+    for (int i = 0; i < g_psbt_file_count; i++) {
+      rows[i] = {g_psbt_files[i].name, nullptr, color::kMuted};
+    }
+    render_menu_rows(y0, rows, g_psbt_file_count);
+  } else if (g_tab == kTabWallet) {
+    char fp[10];
+    format_fingerprint_spaced(g_session.master_key().master_fingerprint, fp);
+    const MenuRow rows[kWalletRowCount] = {
+        {"Fingerprint", fp, color::kMuted},
+        {"Rede", g_network_choice == Network::kTestnet ? "testnet" : "mainnet",
+         g_network_choice == Network::kTestnet ? color::kError : color::kMuted},
+        {"Script", "P2WPKH m/84'", color::kMuted},
+        {"Exportar xpub", ">", color::kMuted},
+        {"Endereco de recebimento", ">", color::kMuted},
+    };
+    render_menu_rows(y0, rows, kWalletRowCount);
+  } else {
+    char bright[8];
+    snprintf(bright, sizeof(bright), "%d%%", kBrightnessPct[g_brightness_idx]);
+    char lock[12];
+    snprintf(lock, sizeof(lock), "%lu min",
+             static_cast<unsigned long>(kSessionTimeoutMs / 60000));
+    const MenuRow rows[kSessionRowCount] = {
+        {"Brilho", bright, color::kMuted},
+        {"Bloqueio auto", lock, color::kMuted},
+        {"Encerrar sessao", ">", color::kError},
+    };
+    render_menu_rows(y0, rows, kSessionRowCount);
   }
-  ui_draw_line(ui_max_lines() - 1, "Enter=abrir ^C=voltar", TextStyle::kMuted);
 }
 
 void render_psbt_review_output() {
-  ui_clear();
-  int line = 0;
-  char header[32];
-  snprintf(header, sizeof(header), "Output %d/%d", g_psbt_output_index + 1,
-          g_summary.num_outputs);
-  ui_draw_line(line++, header);
+  bool last = g_psbt_output_index + 1 >= g_summary.num_outputs;
+  ui_begin_screen("REVISAR", "ESC cancelar", last ? "OK resumo" : "OK proxima");
 
+  // Linha 1: "1/2 DESTINO" etc. (o nome do arquivo fica na lista e no "Concluido").
+  char head[12];
+  snprintf(head, sizeof(head), "%d/%d", g_psbt_output_index + 1, g_summary.num_outputs);
+  ui_text(kMargin, 18, head, color::kMuted, Font::kBody);
+  int label_x = kMargin + ui_text_width(head, Font::kBody) + 8;
   if (g_output_text.claimed_change_invalid) {
-    ui_draw_line(line++, "ALEGA SER TROCO MAS NAO BATE!", TextStyle::kWarning);
+    ui_text(label_x, 18, "ALEGA TROCO: NAO BATE!", color::kError, Font::kBody);
   } else if (g_output_text.is_change) {
-    ui_draw_line(line++, "Troco (verificado)");
+    char label[28];
+    snprintf(label, sizeof(label),
+             g_output_text.change_index_high ? "TROCO #%lu ALTO!" : "TROCO #%lu verif.",
+             static_cast<unsigned long>(g_output_text.change_index));
+    ui_text(label_x, 18, label, g_output_text.change_index_high ? color::kError : color::kOk,
+            Font::kBody);
   } else {
-    ui_draw_line(line++, "Destino externo");
+    ui_text(label_x, 18, "DESTINO EXTERNO", color::kText, Font::kBody);
   }
-  draw_wrapped(&line, g_output_text.address_grouped);
-  ui_draw_line(line++, g_output_text.amount_btc);
-  ui_draw_line(line++, g_output_text.amount_sats, TextStyle::kMuted);
 
-  ui_draw_line(ui_max_lines() - 1, "Enter=proximo ^C=cancelar", TextStyle::kMuted);
+  // amount_btc = "0.01250000 BTC": numero grande + unidade menor.
+  char amount[sizeof(g_output_text.amount_btc)];
+  copy_str(amount, sizeof(amount), g_output_text.amount_btc);
+  char *unit = strchr(amount, ' ');
+  if (unit != nullptr) *unit++ = '\0';
+  ui_text(kMargin, 35, amount, color::kOrange, Font::kBig);
+  if (unit != nullptr) {
+    ui_text(kMargin + ui_text_width(amount, Font::kBig) + 6, 37, unit, color::kText, Font::kBody);
+  }
+  ui_text(kMargin, 54, g_output_text.amount_sats, color::kMuted, Font::kBody);
+
+  draw_address(72, g_output_text.address_grouped);
 }
 
 void render_psbt_review_fee() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, "Resumo da transacao");
-  ui_draw_line(line++, "");
-  char in_line[32];
-  snprintf(in_line, sizeof(in_line), "Entradas: %d", g_summary.num_inputs);
-  ui_draw_line(line++, in_line);
-  char out_line[32];
-  snprintf(out_line, sizeof(out_line), "Saidas: %d", g_summary.num_outputs);
-  ui_draw_line(line++, out_line);
-  ui_draw_line(line++, "");
-  char fee_line[48];
-  snprintf(fee_line, sizeof(fee_line), "Taxa: %s (%s)", g_fee_text.fee_sats,
-          g_fee_text.fee_rate);
-  ui_draw_line(line++, fee_line,
-              g_fee_text.high_fee_warning ? TextStyle::kWarning : TextStyle::kNormal);
+  ui_begin_screen("RESUMO", "ESC cancelar", "OK continuar");
+  char n[8];
+  snprintf(n, sizeof(n), "%d", g_summary.num_inputs);
+  kv_line(19, "Entradas", n);
+  snprintf(n, sizeof(n), "%d", g_summary.num_outputs);
+  kv_line(37, "Saidas", n);
+  uint16_t fee_color = g_fee_text.high_fee_warning ? color::kError : color::kText;
+  kv_line(55, "Taxa", g_fee_text.fee_sats, fee_color);
+  kv_line(73, "Taxa estimada", g_fee_text.fee_rate, fee_color);
   if (g_fee_text.high_fee_warning) {
-    ui_draw_line(line++, "AVISO: taxa alta!", TextStyle::kWarning);
+    ui_text(kScreenW / 2, 96, "AVISO: taxa alta!", color::kError, Font::kTitle, Align::kCenter);
   }
-  ui_draw_line(line++, "");
-  ui_draw_line(ui_max_lines() - 1, "Y/Enter=assinar ^C=cancela",
-              TextStyle::kMuted);
+}
+
+void draw_hold_bar() { ui_progress(16, 74, kScreenW - 32, 18, g_hold_pct, "SEGURE ENTER"); }
+
+void render_psbt_confirm() {
+  ui_begin_screen("CONFIRMAR", "ESC voltar", "segure OK");
+  ui_text(kScreenW / 2, 26, "Assinar transacao?", color::kText, Font::kTitle, Align::kCenter);
+  char sub[48];
+  snprintf(sub, sizeof(sub), "%d saidas - taxa %s", g_summary.num_outputs, g_fee_text.fee_sats);
+  ui_text(kScreenW / 2, 48, sub, color::kMuted, Font::kBody, Align::kCenter);
+  draw_hold_bar();
+}
+
+void render_signing() {
+  ui_begin_screen("ASSINANDO", nullptr, "nao desligue");
+  ui_text(kScreenW / 2, 50, "Assinando...", color::kText, Font::kTitle, Align::kCenter);
+  ui_text(kScreenW / 2, 74, "calculando assinaturas", color::kMuted, Font::kSmall,
+          Align::kCenter);
 }
 
 void render_psbt_done() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, "PSBT assinada e gravada:");
-  draw_wrapped(&line, g_status_line);
-  ui_draw_line(line++, "");
-  ui_draw_line(line++, "Enter=voltar ao menu", TextStyle::kMuted);
+  ui_begin_screen("CONCLUIDO", "arquivo no SD", "OK voltar");
+  ui_icon_ok(kScreenW / 2, 38);
+  ui_text(kScreenW / 2, 58, "Assinado e salvo", color::kText, Font::kTitle, Align::kCenter);
+  ui_text(kScreenW / 2, 82, g_signed_name, color::kMuted, Font::kSmall, Align::kCenter);
+}
+
+void render_error() {
+  ui_begin_screen("ERRO", "ESC voltar", "OK voltar");
+  ui_icon_error(kScreenW / 2, 38);
+  ui_text(kScreenW / 2, 58, g_error_title, color::kText, Font::kTitle, Align::kCenter);
+  ui_text(kScreenW / 2, 80, g_error_msg, color::kMuted, Font::kBody, Align::kCenter);
+}
+
+void render_xpub_choice() {
+  ui_begin_screen("XPUB", "ESC voltar  ^v mover", "OK escolher");
+  const MenuRow rows[kXpubChoiceCount] = {
+      {"Ver RAW", nullptr, color::kMuted},
+      {"Baixar arquivo", nullptr, color::kMuted},
+  };
+  render_menu_rows(kBodyTop + 4, rows, kXpubChoiceCount);
 }
 
 void render_xpub_export() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, g_status_line[0] != '\0' ? g_status_line
-                                                : "xpub exportado:");
-  char fp[9];
-  format_fingerprint(g_session.master_key().master_fingerprint, fp);
-  char fp_line[16];
-  snprintf(fp_line, sizeof(fp_line), "fp: %s", fp);
-  ui_draw_line(line++, fp_line);
-
+  ui_begin_screen("XPUB", nullptr, "OK voltar");
+  int y = 18;
+  if (g_xpub_write_attempted) {
+    ui_text(kMargin, y, g_xpub_saved ? "Gravado em wallet_export.txt"
+                                      : "Falha ao gravar (cartao ausente?)",
+            g_xpub_saved ? color::kOk : color::kError);
+    y += 10;
+  }
+  char fp[10];
+  format_fingerprint_spaced(g_session.master_key().master_fingerprint, fp);
+  char info[40];
+  snprintf(info, sizeof(info), "fp %s  m/84'/%d'/0'", fp,
+           g_network_choice == Network::kMainnet ? 0 : 1);
+  ui_text(kMargin, y, info, color::kMuted);
+  y += 12;
   char xpub[XPUB_MAXLEN];
   if (serialize_account_xpub(g_session.master_key(), xpub, sizeof(xpub))) {
-    draw_wrapped(&line, xpub);
+    draw_address(y, xpub);
   }
-  ui_draw_line(ui_max_lines() - 1, "Enter=voltar ao menu", TextStyle::kMuted);
 }
 
 void render_receive_address_entry() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, "Indice do endereco (0-999):");
-  char idx_line[16];
-  snprintf(idx_line, sizeof(idx_line), "> %s",
-          g_index_entry_len > 0 ? g_index_entry : "0");
-  ui_draw_line(line++, idx_line);
-  ui_draw_line(line++, "");
-  ui_draw_line(line++, "Digite numeros, Enter confirma", TextStyle::kMuted);
-  ui_draw_line(line++, "^C volta ao menu", TextStyle::kMuted);
+  ui_begin_screen("RECEBER", "ESC voltar  DEL apagar", "OK mostrar");
+  ui_text(kMargin, 24, "INDICE DO ENDERECO (0-999)", color::kMuted);
+  ui_input_box(kMargin, 36, kContentW, g_index_entry, false);
+  ui_text(kMargin, 66, "vazio = indice 0", color::kMuted);
 }
 
 void render_receive_address_show() {
-  ui_clear();
-  int line = 0;
-  ui_draw_line(line++, g_status_line);
-  ui_draw_line(line++, "");
-  uint32_t index = g_index_entry_len > 0 ? static_cast<uint32_t>(atoi(g_index_entry))
-                                        : 0;
+  uint32_t index = g_index_entry_len > 0 ? static_cast<uint32_t>(atoi(g_index_entry)) : 0;
+  char title[20];
+  snprintf(title, sizeof(title), "RECEBER #%lu", static_cast<unsigned long>(index));
+  ui_begin_screen(title, nullptr, "OK voltar");
+  char path[32];
+  snprintf(path, sizeof(path), "m/84'/%d'/0'/0/%lu",
+           g_network_choice == Network::kMainnet ? 0 : 1, static_cast<unsigned long>(index));
+  ui_text(kMargin, 20, path, color::kMuted);
+
   char addr[74];
-  if (derive_address(g_session.master_key(), kChangeExternal, index, addr,
-                    sizeof(addr))) {
+  if (derive_address(g_session.master_key(), kChangeExternal, index, addr, sizeof(addr))) {
     char grouped[100];
     format_address_grouped(addr, grouped, sizeof(grouped));
-    draw_wrapped(&line, grouped);
+    draw_address(34, grouped);
   } else {
-    ui_draw_line(line++, "(falha ao derivar)", TextStyle::kWarning);
+    ui_text(kMargin, 34, "(falha ao derivar)", color::kError, Font::kBody);
   }
-  ui_draw_line(ui_max_lines() - 1, "Enter=voltar ao menu", TextStyle::kMuted);
+}
+
+HeaderNet header_net() {
+  if (g_state == State::kSelectWordCount || g_state == State::kSelectNetwork) {
+    return HeaderNet::kNone;
+  }
+  return g_network_choice == Network::kTestnet ? HeaderNet::kTestnet : HeaderNet::kMainnet;
 }
 
 void render() {
+  ui_set_header_status(header_net(), g_sd_ok);
   switch (g_state) {
     case State::kSelectWordCount: render_select_word_count(); break;
     case State::kSelectNetwork: render_select_network(); break;
@@ -413,14 +522,20 @@ void render() {
     case State::kPassphraseEntry: render_passphrase_entry(); break;
     case State::kFingerprintConfirm: render_fingerprint_confirm(); break;
     case State::kMainMenu: render_main_menu(); break;
-    case State::kPsbtList: render_psbt_list(); break;
     case State::kPsbtReviewOutput: render_psbt_review_output(); break;
     case State::kPsbtReviewFee: render_psbt_review_fee(); break;
+    case State::kPsbtConfirm: render_psbt_confirm(); break;
     case State::kPsbtDone: render_psbt_done(); break;
+    case State::kError: render_error(); break;
+    case State::kXpubChoice: render_xpub_choice(); break;
     case State::kXpubExport: render_xpub_export(); break;
     case State::kReceiveAddressEntry: render_receive_address_entry(); break;
     case State::kReceiveAddressShow: render_receive_address_show(); break;
   }
+}
+
+void render_boot(int pct) {
+  ui_progress(kScreenW / 2 - 55, 100, 110, 2, pct, nullptr);
 }
 
 // --- transicoes de estado / logica -------------------------------------------
@@ -444,8 +559,8 @@ void finish_mnemonic_entry() {
 }
 
 void attempt_derive_and_show_fingerprint() {
-  if (!derive_master_key(g_mnemonic_text, g_passphrase.value(),
-                        g_network_choice, &g_pending_mk)) {
+  if (!derive_master_key(g_mnemonic_text, g_passphrase.value(), g_network_choice,
+                         &g_pending_mk)) {
     set_status("Falha ao derivar chave");
     return;
   }
@@ -456,33 +571,24 @@ void confirm_fingerprint_and_start_session() {
   g_session.start(&g_pending_mk); // move: g_pending_mk fica vazio depois
   wipe_seed_material();           // mnemonico e passphrase nao sao mais
                                   // necessarios: a MasterKey ja esta na sessao
-  g_menu_index = 0;
-  set_status("");
-  g_state = State::kMainMenu;
-}
-
-void refresh_psbt_list() {
-  g_psbt_file_count = list_psbt_files(g_psbt_files, kMaxPsbtFilesListed);
-  g_psbt_file_selected = 0;
+  go_to_menu(kTabSign);
 }
 
 void start_psbt_review() {
   size_t len = 0;
   if (!read_psbt_file(g_psbt_files[g_psbt_file_selected].name, g_psbt_io_buf,
                       sizeof(g_psbt_io_buf), &len)) {
-    set_status("Falha ao ler o arquivo");
-    g_state = State::kMainMenu;
+    show_error("Falha ao ler", "erro lendo o arquivo do SD");
     return;
   }
-  if (g_psbt.load(g_psbt_io_buf, len) != PsbtError::kNone) {
-    set_status("PSBT invalida ou malformada");
-    g_state = State::kMainMenu;
+  PsbtError err = g_psbt.load(g_psbt_io_buf, len);
+  if (err != PsbtError::kNone) {
+    show_error("PSBT invalida", psbt_error_message(err));
     return;
   }
-  if (g_psbt.validate(g_session.master_key(), g_network_choice, &g_summary) !=
-      PsbtError::kNone) {
-    set_status("PSBT rejeitada na validacao");
-    g_state = State::kMainMenu;
+  err = g_psbt.validate(g_session.master_key(), g_network_choice, &g_summary);
+  if (err != PsbtError::kNone) {
+    show_error("PSBT rejeitada", psbt_error_message(err));
     return;
   }
   g_psbt_output_index = 0;
@@ -490,57 +596,136 @@ void start_psbt_review() {
   g_state = State::kPsbtReviewOutput;
 }
 
-void sign_and_write_psbt() {
+void enter_psbt_confirm() {
+  g_hold_armed = false;
+  g_holding = false;
+  g_hold_pct = 0;
+  g_state = State::kPsbtConfirm;
+}
+
+// Chamado ao terminar o "segure Enter" em kPsbtConfirm: assina e grava
+// direto no SD como <nome>_signed.psbt.
+void sign_and_save_psbt() {
+  render_signing();
   if (g_psbt.sign(g_session.master_key()) != PsbtError::kNone) {
-    set_status("Falha ao assinar");
-    g_state = State::kMainMenu;
+    show_error("Falha ao assinar", "nada foi gravado no SD");
     return;
   }
   size_t written = 0;
   if (!g_psbt.serialize_signed(g_psbt_io_buf, sizeof(g_psbt_io_buf), &written)) {
-    set_status("Falha ao serializar PSBT assinada");
-    g_state = State::kMainMenu;
+    show_error("Falha ao serializar", "PSBT assinada grande demais");
     return;
   }
-  if (!write_signed_psbt(g_psbt_files[g_psbt_file_selected].name, g_psbt_io_buf,
-                        written)) {
-    set_status("Falha ao gravar no cartao (removido?)");
-    g_state = State::kMainMenu;
+  if (!write_signed_psbt(g_psbt_files[g_psbt_file_selected].name, g_psbt_io_buf, written)) {
+    show_error("Falha ao gravar", "cartao SD removido?");
     return;
   }
-  char signed_name[kMaxFilenameLen + 1];
-  build_signed_filename(g_psbt_files[g_psbt_file_selected].name, signed_name,
-                        sizeof(signed_name));
-  set_status(signed_name);
+  build_signed_filename(g_psbt_files[g_psbt_file_selected].name, g_signed_name,
+                        sizeof(g_signed_name));
   g_state = State::kPsbtDone;
 }
 
-void do_xpub_export() {
+void do_xpub_export_raw() {
+  g_xpub_write_attempted = false;
+  g_state = State::kXpubExport;
+}
+
+void do_xpub_export_download() {
   char xpub[XPUB_MAXLEN];
   if (!serialize_account_xpub(g_session.master_key(), xpub, sizeof(xpub))) {
-    set_status("Falha ao gerar xpub");
-    g_state = State::kMainMenu;
+    show_error("Falha no xpub", "erro ao serializar a conta");
     return;
   }
   char fp[9];
   format_fingerprint(g_session.master_key().master_fingerprint, fp);
-  char text[512];
-  snprintf(text, sizeof(text),
-          "Master Fingerprint: %s\r\n"
-          "Derivation Path: m/84'/%d'/0'\r\n"
-          "Extended Public Key: %s\r\n",
-          fp, g_network_choice == Network::kMainnet ? 0 : 1, xpub);
-  if (write_text_file(kXpubExportFile, text)) {
-    set_status("Gravado em wallet_export.txt");
-  } else {
-    set_status("Falha ao gravar (cartao ausente?)");
+  char receive_desc[200];
+  char change_desc[200];
+  if (!build_descriptor(g_session.master_key(), kChangeExternal, receive_desc,
+                        sizeof(receive_desc)) ||
+      !build_descriptor(g_session.master_key(), kChangeInternal, change_desc,
+                        sizeof(change_desc))) {
+    show_error("Falha no xpub", "erro ao montar descriptor");
+    return;
   }
+  char text[768];
+  snprintf(text, sizeof(text),
+           "Master Fingerprint: %s\r\n"
+           "Derivation Path: m/84'/%d'/0'\r\n"
+           "Extended Public Key: %s\r\n"
+           "Receive Descriptor: %s\r\n"
+           "Change Descriptor: %s\r\n",
+           fp, g_network_choice == Network::kMainnet ? 0 : 1, xpub, receive_desc, change_desc);
+  g_xpub_saved = write_text_file(kXpubExportFile, text);
+  g_xpub_write_attempted = true;
   g_state = State::kXpubExport;
+}
+
+void activate_menu_row() {
+  switch (g_tab) {
+    case kTabSign:
+      if (g_psbt_file_count > 0) {
+        g_psbt_file_selected = g_row;
+        start_psbt_review();
+      }
+      break;
+    case kTabWallet:
+      if (g_row == kRowXpub) {
+        g_row = 0;
+        g_state = State::kXpubChoice;
+      } else if (g_row == kRowReceive) {
+        g_index_entry[0] = '\0';
+        g_index_entry_len = 0;
+        g_state = State::kReceiveAddressEntry;
+      }
+      break;
+    case kTabSession:
+      if (g_row == kRowBrightness) {
+        g_brightness_idx = (g_brightness_idx + 1) % kBrightnessCount;
+        ui_set_brightness(kBrightnessLevels[g_brightness_idx]);
+      } else if (g_row == kRowEndSession) {
+        go_to_start("Sessao encerrada");
+      }
+      break;
+  }
+}
+
+// Chamado a cada iteracao do loop em kPsbtConfirm. Retorna true se assinou
+// (a tela ja mudou e precisa de render()).
+bool update_hold() {
+  if (!ui_enter_held()) {
+    g_hold_armed = true;
+    if (g_holding) {
+      g_holding = false;
+      g_hold_pct = 0;
+      draw_hold_bar();
+    }
+    return false;
+  }
+  if (!g_hold_armed) return false;
+
+  uint32_t now = millis();
+  if (!g_holding) {
+    g_holding = true;
+    g_hold_start_ms = now;
+  }
+  g_session.touch();
+  int pct = static_cast<int>((now - g_hold_start_ms) * 100 / kHoldToSignMs);
+  if (pct > 100) pct = 100;
+  if (pct != g_hold_pct) {
+    g_hold_pct = pct;
+    draw_hold_bar();
+  }
+  if (pct < 100) return false;
+  g_holding = false;
+  g_hold_armed = false;
+  sign_and_save_psbt();
+  return true;
 }
 
 // --- entrada de teclado por estado -------------------------------------------
 
 void handle_key(const KeyEvent &key) {
+  set_status("");
   switch (g_state) {
     case State::kSelectWordCount:
       if ((key.ch == kKeyUp) || (key.ch == kKeyDown)) {
@@ -554,9 +739,8 @@ void handle_key(const KeyEvent &key) {
 
     case State::kSelectNetwork:
       if ((key.ch == kKeyUp) || (key.ch == kKeyDown)) {
-        g_network_choice = (g_network_choice == Network::kMainnet)
-                              ? Network::kTestnet
-                              : Network::kMainnet;
+        g_network_choice = (g_network_choice == Network::kMainnet) ? Network::kTestnet
+                                                                   : Network::kMainnet;
       } else if (key.enter) {
         enter_mnemonic_entry();
       } else if (key.esc) {
@@ -624,104 +808,89 @@ void handle_key(const KeyEvent &key) {
       }
       break;
 
-    case State::kMainMenu:
-      if ((key.ch == kKeyUp)) {
-        g_menu_index = (g_menu_index + kMenuItemCount - 1) % kMenuItemCount;
-      } else if ((key.ch == kKeyDown)) {
-        g_menu_index = (g_menu_index + 1) % kMenuItemCount;
+    case State::kMainMenu: {
+      int n = menu_row_count();
+      if (key.ch == kKeyLeft || key.ch == kKeyRight) {
+        go_to_menu((g_tab + (key.ch == kKeyRight ? 1 : kTabCount - 1)) % kTabCount);
+      } else if (key.ch == kKeyUp && n > 0) {
+        g_row = (g_row + n - 1) % n;
+      } else if (key.ch == kKeyDown && n > 0) {
+        g_row = (g_row + 1) % n;
       } else if (key.enter) {
-        set_status("");
-        switch (g_menu_index) {
-          case 0:
-            refresh_psbt_list();
-            g_state = State::kPsbtList;
-            break;
-          case 1:
-            do_xpub_export();
-            break;
-          case 2:
-            g_index_entry[0] = '\0';
-            g_index_entry_len = 0;
-            g_state = State::kReceiveAddressEntry;
-            break;
-          case 3:
-            go_to_start("Sessao encerrada");
-            break;
-        }
+        activate_menu_row();
       }
       break;
-
-    case State::kPsbtList:
-      if (key.esc) {
-        g_state = State::kMainMenu;
-      } else if ((key.ch == kKeyUp) && g_psbt_file_count > 0) {
-        g_psbt_file_selected =
-            (g_psbt_file_selected + g_psbt_file_count - 1) % g_psbt_file_count;
-      } else if ((key.ch == kKeyDown) && g_psbt_file_count > 0) {
-        g_psbt_file_selected = (g_psbt_file_selected + 1) % g_psbt_file_count;
-      } else if (key.enter && g_psbt_file_count > 0) {
-        start_psbt_review();
-      }
-      break;
+    }
 
     case State::kPsbtReviewOutput:
       if (key.esc) {
+        go_to_menu(kTabSign);
         set_status("Cancelado pelo usuario");
-        g_state = State::kMainMenu;
       } else if (key.enter) {
         g_psbt_output_index++;
         if (g_psbt_output_index >= g_summary.num_outputs) {
           build_fee_review(g_summary, &g_fee_text);
           g_state = State::kPsbtReviewFee;
         } else {
-          build_output_review(g_summary.outputs[g_psbt_output_index],
-                              &g_output_text);
+          build_output_review(g_summary.outputs[g_psbt_output_index], &g_output_text);
         }
       }
       break;
 
     case State::kPsbtReviewFee:
       if (key.esc) {
+        go_to_menu(kTabSign);
         set_status("Cancelado pelo usuario");
-        g_state = State::kMainMenu;
-      } else if (key.enter || key.ch == 'y' || key.ch == 'Y') {
-        sign_and_write_psbt();
+      } else if (key.enter) {
+        enter_psbt_confirm();
       }
       break;
 
+    case State::kPsbtConfirm:
+      // Enter e tratado por update_hold() no loop (precisa do estado "segurado").
+      if (key.esc) g_state = State::kPsbtReviewFee;
+      break;
+
     case State::kPsbtDone:
-      if (key.enter || key.esc) {
-        set_status("");
-        g_state = State::kMainMenu;
+    case State::kError:
+      if (key.enter || key.esc) go_to_menu(kTabSign);
+      break;
+
+    case State::kXpubChoice:
+      if (key.esc) {
+        go_to_menu(kTabWallet);
+      } else if (key.ch == kKeyUp) {
+        g_row = (g_row + kXpubChoiceCount - 1) % kXpubChoiceCount;
+      } else if (key.ch == kKeyDown) {
+        g_row = (g_row + 1) % kXpubChoiceCount;
+      } else if (key.enter) {
+        switch (g_row) {
+          case kXpubChoiceRaw: do_xpub_export_raw(); break;
+          case kXpubChoiceDownload: do_xpub_export_download(); break;
+        }
       }
       break;
 
     case State::kXpubExport:
-      if (key.enter || key.esc) {
-        set_status("");
-        g_state = State::kMainMenu;
-      }
+      if (key.enter || key.esc) g_state = State::kXpubChoice;
       break;
 
     case State::kReceiveAddressEntry:
       if (key.esc) {
-        g_state = State::kMainMenu;
+        go_to_menu(kTabWallet);
       } else if (key.backspace) {
         if (g_index_entry_len > 0) g_index_entry[--g_index_entry_len] = '\0';
       } else if (key.enter) {
         g_state = State::kReceiveAddressShow;
       } else if (key.ch >= '0' && key.ch <= '9' &&
-                static_cast<size_t>(g_index_entry_len) + 1 <
-                    sizeof(g_index_entry)) {
+                 static_cast<size_t>(g_index_entry_len) + 1 < sizeof(g_index_entry)) {
         g_index_entry[g_index_entry_len++] = key.ch;
         g_index_entry[g_index_entry_len] = '\0';
       }
       break;
 
     case State::kReceiveAddressShow:
-      if (key.enter || key.esc) {
-        g_state = State::kMainMenu;
-      }
+      if (key.enter || key.esc) go_to_menu(kTabWallet);
       break;
   }
 }
@@ -730,31 +899,45 @@ void handle_key(const KeyEvent &key) {
 
 void setup() {
   ui_init();
-  sd_init(); // se falhar, so as operacoes de PSBT/export falharao depois
-  ui_set_persistent_banner(nullptr);
+  ui_clear();
+  ui_logo(kScreenW / 2, 36);
+  ui_text(kScreenW / 2, 66, "BTC SIGNER", color::kText, Font::kTitle, Align::kCenter);
+  ui_text(kScreenW / 2, 86, "PSBT - OFFLINE - AIR-GAPPED", color::kMuted, Font::kSmall,
+          Align::kCenter);
+  render_boot(10);
+  g_sd_ok = sd_init(); // se falhar, so as operacoes de PSBT/export falharao depois
+  for (int pct = 20; pct <= 100; pct += 10) {
+    render_boot(pct);
+    delay(60);
+  }
   render();
 }
 
 void loop() {
   ui_update();
 
-  if (g_session.is_active() && g_session.is_expired()) {
+  // Antes da sessao existir o mnemonico (e depois g_pending_mk) ja esta na
+  // RAM, entao o timeout vale tambem para essas telas.
+  bool pre_session = g_state == State::kMnemonicEntry ||
+                     g_state == State::kChecksumFailed ||
+                     g_state == State::kPassphraseEntry ||
+                     g_state == State::kFingerprintConfirm;
+  if ((pre_session && millis() - g_last_key_ms >= kSessionTimeoutMs) ||
+      (g_session.is_active() && g_session.is_expired())) {
     go_to_start("Sessao encerrada por inatividade");
+    render();
+    return;
+  }
+
+  if (g_state == State::kPsbtConfirm && update_hold()) {
     render();
     return;
   }
 
   KeyEvent key;
   if (!ui_poll_key(&key)) return;
+  g_last_key_ms = millis();
   g_session.touch();
-
-  // Faixa persistente "TESTNET": so existe depois que a rede foi escolhida.
-  if (g_state != State::kSelectWordCount && g_state != State::kSelectNetwork) {
-    ui_set_persistent_banner(g_network_choice == Network::kTestnet
-                                ? "TESTNET/SIGNET"
-                                : nullptr);
-  }
-
   handle_key(key);
   render();
 }

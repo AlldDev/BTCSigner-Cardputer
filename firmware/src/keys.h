@@ -50,12 +50,14 @@ bool derive_address(const MasterKey &mk, uint32_t change, uint32_t index,
 // out deve ter pelo menos XPUB_MAXLEN bytes.
 bool serialize_account_xpub(const MasterKey &mk, char *out, size_t out_len);
 
-// Verifica se (change, index) produz o hash160 fornecido — usado para
-// confirmar que um output de troco realmente pertence a esta seed antes de
-// exibi-lo como "Troco (verificado)" (secao 9 do spec). Testa apenas
-// change=1 (troco interno) nos primeiros `scan_limit` indices.
-bool find_change_index(const MasterKey &mk, const uint8_t pubkeyhash[20],
-                       uint32_t scan_limit, uint32_t *out_index);
+// Checksum BIP380 (8 chars + nulo em `out`) de um output descriptor.
+// false se `desc` tiver caractere fora do charset de descriptors.
+bool descriptor_checksum(const char *desc, char out[9]);
+
+// Output descriptor BIP380 da conta, importavel direto no Sparrow/Core:
+// wpkh([fp/84h/<0|1>h/0h]xpub.../<change>/*)#checksum. Usa xpub/tpub padrao
+// (nao zpub/vpub, que descriptors nao aceitam).
+bool build_descriptor(const MasterKey &mk, uint32_t change, char *out, size_t out_len);
 
 // Zera todo material privado das estruturas (private_key, chain_code,
 // private_key_extension, fingerprint). Seguro para chamar mais de uma vez.

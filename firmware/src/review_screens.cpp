@@ -21,6 +21,29 @@ bool format_address_grouped(const char *address, char *out, size_t out_len) {
   return true;
 }
 
+bool wrap_next_line(const char *text, size_t *pos, size_t max_chars, size_t *line_start,
+                    size_t *line_len) {
+  if (text == nullptr || pos == nullptr || max_chars == 0) return false;
+  size_t len = strlen(text);
+  size_t p = *pos;
+  while (p < len && text[p] == ' ') p++;
+  if (p >= len) {
+    *pos = len;
+    return false;
+  }
+  size_t n = len - p;
+  if (n > max_chars) {
+    n = max_chars;
+    size_t cut = n;
+    while (cut > 0 && text[p + cut] != ' ') cut--;
+    if (cut > 0) n = cut;
+  }
+  *line_start = p;
+  *line_len = n;
+  *pos = p + n;
+  return true;
+}
+
 bool format_btc(uint64_t sats, char *out, size_t out_len) {
   if (out == nullptr) return false;
   uint64_t whole = sats / 100000000ull;
@@ -51,6 +74,8 @@ void build_output_review(const OutputInfo &output, OutputReviewText *out) {
   format_btc(output.amount_sats, out->amount_btc, sizeof(out->amount_btc));
   format_sats(output.amount_sats, out->amount_sats, sizeof(out->amount_sats));
   out->is_change = output.is_change;
+  out->change_index = output.change_index;
+  out->change_index_high = output.change_index_high;
   out->claimed_change_invalid = output.claimed_change_invalid;
 }
 

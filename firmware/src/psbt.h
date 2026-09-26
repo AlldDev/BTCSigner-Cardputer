@@ -38,6 +38,8 @@ enum class PsbtError {
   kAlreadyHasSignature,   // PARTIAL_SIG/FINAL_* presentes: fluxo fora do escopo
   kMissingWitnessUtxo,
   kMissingBip32Derivation,
+  kMissingNonWitnessUtxo,  // prev-tx completa exigida para verificar o valor
+  kPrevTxMismatch,         // prev-tx nao bate com outpoint/witness_utxo
   kDuplicateField,
   kFingerprintMismatch,
   kDerivationPathMismatch, // fora de m/84'/coin'/0'/{0,1}/i da conta da sessao
@@ -58,6 +60,7 @@ struct OutputInfo {
   uint64_t amount_sats = 0;
   bool is_change = false;          // derivacao E script batem com nossa seed
   uint32_t change_index = 0;       // valido apenas se is_change
+  bool change_index_high = false;  // is_change com indice > kChangeIndexWarning
   // O output alega (via PSBT_OUT_BIP32_DERIVATION) ser troco desta sessao,
   // mas a derivacao ou o hash nao batem — deve ser exibido como destino
   // EXTERNO com um aviso destacado (secao 9 do spec), nao como troco comum.
@@ -98,9 +101,17 @@ struct InputMeta {
   uint64_t witness_value_sats = 0;
   ByteSpan witness_script_pubkey; // scriptPubKey do UTXO sendo gasto
 
+  // Tx anterior completa (PSBT_IN_NON_WITNESS_UTXO). BIP143 so compromete o
+  // valor do input sendo assinado; sem conferir a prev-tx, duas PSBTs que
+  // mentem valores diferentes combinam numa tx com taxa inflada
+  // (CVE-2020-14199). verify_prev_tx() prova o witness_utxo por ela.
+  bool has_non_witness_utxo = false;
+  ByteSpan non_witness_utxo;
+
   bool has_bip32_derivation = false;
   uint8_t claimed_pubkey[33] = {0};
   uint32_t claimed_fingerprint = 0;
+  uint32_t coin_type = 0; // path[1] alegado (84'/coin'), indica a rede
   uint32_t change = 0;
   uint32_t index = 0;
 
@@ -119,6 +130,7 @@ struct OutputMeta {
 
   bool has_bip32_derivation = false;
   uint32_t claimed_fingerprint = 0;
+  uint32_t coin_type = 0; // path[1] alegado (84'/coin'), indica a rede
   uint32_t change = 0;
   uint32_t index = 0;
 };
@@ -143,7 +155,8 @@ public:
 
   // Valida tudo que a secao 9 do spec exige contra a MasterKey/rede da
   // sessao atual: fingerprint e caminho de derivacao de cada input, tipo de
-  // script (P2WPKH), sighash (so ALL), saldo de entradas >= saidas, rede
+  // script (P2WPKH), valor/script de cada input provados pela tx anterior
+  // (non_witness_utxo, obrigatoria), sighash (so ALL), saldo de entradas >= saidas, rede
   // dos outputs legados, e deteccao/verificacao de troco. `out_summary` e
   // obrigatorio (nao pode ser nullptr) e e escrito progressivamente durante
   // a validacao — so deve ser lido pelo chamador se o retorno for
@@ -169,6 +182,7 @@ private:
   PsbtError parse_input_map(int index, size_t *cursor_pos);
   PsbtError parse_output_map(int index, size_t *cursor_pos);
   PsbtError cross_check_input(int index, const MasterKey &mk);
+  PsbtError verify_prev_tx(int index) const;
   void fill_output_info(int index, const MasterKey &mk, Network network,
                        OutputInfo *info) const;
   bool build_sighash(int index, uint8_t digest[32]) const;

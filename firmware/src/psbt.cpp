@@ -227,6 +227,10 @@ bool base64_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap,
 
 constexpr uint8_t kPsbtMagic[5] = {0x70, 0x73, 0x62, 0x74, 0xff};
 
+uint32_t coin_type_for(Network network) {
+  return network == Network::kMainnet ? kCoinTypeMainnet : kCoinTypeTestnet;
+}
+
 bool is_p2wpkh(const uint8_t *script, size_t len, const uint8_t **hash20) {
   if (len != 22 || script[0] != 0x00 || script[1] != 0x14) return false;
   *hash20 = script + 2;
@@ -396,6 +400,12 @@ PsbtError Psbt::parse_input_map(int index, size_t *cursor_pos) {
     if (!read_value(&c, &value)) return PsbtError::kTruncated;
 
     switch (keytype) {
+      case 0x00: // PSBT_IN_NON_WITNESS_UTXO — conferido em verify_prev_tx()
+        if (m.has_non_witness_utxo) return PsbtError::kDuplicateField;
+        if (keydata.length != 0) return PsbtError::kMalformed;
+        m.has_non_witness_utxo = true;
+        m.non_witness_utxo = value;
+        break;
       case 0x01: { // PSBT_IN_WITNESS_UTXO
         if (m.has_witness_utxo) return PsbtError::kDuplicateField;
         Cursor vc(buf_, value.offset + value.length, value.offset);
@@ -462,6 +472,7 @@ PsbtError Psbt::parse_input_map(int index, size_t *cursor_pos) {
           return PsbtError::kDerivationPathMismatch;
         }
         m.has_bip32_derivation = true;
+        m.coin_type = path[1];
         m.change = path[3];
         m.index = path[4];
         break;
@@ -515,6 +526,7 @@ PsbtError Psbt::parse_output_map(int index, size_t *cursor_pos) {
         if (shape_ok) {
           m.has_bip32_derivation = true;
           m.claimed_fingerprint = fingerprint;
+          m.coin_type = path[1];
           m.change = path[3];
           m.index = path[4];
         }
@@ -533,10 +545,105 @@ PsbtError Psbt::parse_output_map(int index, size_t *cursor_pos) {
   return PsbtError::kNone;
 }
 
+// Prova o witness_utxo do input `index` pela tx anterior completa: o txid
+// (double-SHA256 da serializacao sem witness) tem que ser o do outpoint, e o
+// output `vout` dela tem que ter o mesmo valor e scriptPubKey.
+PsbtError Psbt::verify_prev_tx(int index) const {
+  const InputMeta &m = inputs_[index];
+  const ByteSpan &prev = m.non_witness_utxo;
+  size_t prev_end = prev.offset + prev.length;
+  Cursor c(buf_, prev_end, prev.offset);
+
+  Hasher h;
+  hasher_Init(&h, HASHER_SHA2D);
+
+  ByteSpan version{};
+  if (!c.read_bytes(4, &version)) return PsbtError::kMalformed;
+  hasher_Update(&h, buf_ + version.offset, 4);
+
+  // Marker 0x00 + flag 0x01 (BIP144): fora do txid. Uma tx com 0 inputs
+  // seria ambigua aqui, mas e invalida de qualquer jeito.
+  bool segwit = c.remaining() >= 2 && buf_[c.pos()] == 0x00 &&
+                buf_[c.pos() + 1] == 0x01;
+  if (segwit) c.skip(2);
+
+  size_t body_start = c.pos();
+  uint64_t in_count;
+  if (!c.read_varint(&in_count) || in_count == 0) return PsbtError::kMalformed;
+  for (uint64_t i = 0; i < in_count; i++) {
+    uint64_t script_len;
+    if (!c.skip(36) || !c.read_varint(&script_len) || script_len > c.remaining() ||
+        !c.skip(static_cast<size_t>(script_len)) || !c.skip(4)) {
+      return PsbtError::kMalformed;
+    }
+  }
+
+  const uint8_t *outpoint = buf_ + tx_inputs_[index].outpoint.offset;
+  uint32_t vout = static_cast<uint32_t>(outpoint[32]) |
+                  (static_cast<uint32_t>(outpoint[33]) << 8) |
+                  (static_cast<uint32_t>(outpoint[34]) << 16) |
+                  (static_cast<uint32_t>(outpoint[35]) << 24);
+  uint64_t out_count;
+  if (!c.read_varint(&out_count)) return PsbtError::kMalformed;
+  bool found = false;
+  uint64_t value = 0;
+  ByteSpan script{};
+  for (uint64_t i = 0; i < out_count; i++) {
+    uint64_t v;
+    uint64_t script_len;
+    ByteSpan s{};
+    if (!c.read_u64_le(&v) || !c.read_varint(&script_len) ||
+        script_len > c.remaining() ||
+        !c.read_bytes(static_cast<size_t>(script_len), &s)) {
+      return PsbtError::kMalformed;
+    }
+    if (i == vout) {
+      found = true;
+      value = v;
+      script = s;
+    }
+  }
+  hasher_Update(&h, buf_ + body_start, c.pos() - body_start);
+
+  if (segwit) {
+    for (uint64_t i = 0; i < in_count; i++) {
+      uint64_t items;
+      if (!c.read_varint(&items)) return PsbtError::kMalformed;
+      for (uint64_t k = 0; k < items; k++) {
+        uint64_t item_len;
+        if (!c.read_varint(&item_len) || item_len > c.remaining() ||
+            !c.skip(static_cast<size_t>(item_len))) {
+          return PsbtError::kMalformed;
+        }
+      }
+    }
+  }
+
+  ByteSpan locktime{};
+  if (!c.read_bytes(4, &locktime)) return PsbtError::kMalformed;
+  if (c.pos() != prev_end) return PsbtError::kMalformed; // lixo apos locktime
+  hasher_Update(&h, buf_ + locktime.offset, 4);
+
+  uint8_t txid[32];
+  hasher_Final(&h, txid);
+
+  if (!found || memcmp(txid, outpoint, 32) != 0) return PsbtError::kPrevTxMismatch;
+  if (value != m.witness_value_sats) return PsbtError::kPrevTxMismatch;
+  if (script.length != m.witness_script_pubkey.length ||
+      memcmp(buf_ + script.offset, buf_ + m.witness_script_pubkey.offset,
+             script.length) != 0) {
+    return PsbtError::kPrevTxMismatch;
+  }
+  return PsbtError::kNone;
+}
+
 PsbtError Psbt::cross_check_input(int index, const MasterKey &mk) {
   InputMeta &m = inputs_[index];
 
   if (!m.has_witness_utxo) return PsbtError::kMissingWitnessUtxo;
+  if (!m.has_non_witness_utxo) return PsbtError::kMissingNonWitnessUtxo;
+  PsbtError prev_err = verify_prev_tx(index);
+  if (prev_err != PsbtError::kNone) return prev_err;
   if (!m.has_bip32_derivation) return PsbtError::kMissingBip32Derivation;
   if (m.sighash_present && m.sighash_type != 0x00000001u) {
     return PsbtError::kUnsupportedSighash;
@@ -544,6 +651,7 @@ PsbtError Psbt::cross_check_input(int index, const MasterKey &mk) {
   if (m.claimed_fingerprint != mk.master_fingerprint) {
     return PsbtError::kFingerprintMismatch;
   }
+  if (m.coin_type != coin_type_for(mk.network)) return PsbtError::kNetworkMismatch;
 
   const uint8_t *hash20 = nullptr;
   if (!is_p2wpkh(buf_ + m.witness_script_pubkey.offset,
@@ -621,7 +729,9 @@ void Psbt::fill_output_info(int index, const MasterKey &mk, Network network,
   if (candidate_change) {
     HDNode node;
     bool matched = false;
-    if (derive_child_node(mk, om.change, om.index, &node)) {
+    // Coin type de outra rede: alegacao falsa, mesmo que o hash batesse.
+    if (om.coin_type == coin_type_for(mk.network) &&
+        derive_child_node(mk, om.change, om.index, &node)) {
       if (hdnode_fill_public_key(&node) == 0) {
         uint8_t derived_hash[20];
         ecdsa_get_pubkeyhash(node.public_key, node.curve->hasher_pubkey,
@@ -633,6 +743,7 @@ void Psbt::fill_output_info(int index, const MasterKey &mk, Network network,
     if (matched) {
       info->is_change = true;
       info->change_index = om.index;
+      info->change_index_high = om.index > kChangeIndexWarning;
     } else {
       info->claimed_change_invalid = true;
     }
@@ -656,6 +767,7 @@ PsbtError Psbt::validate(const MasterKey &mk, Network network,
   for (int i = 0; i < tx_input_count_; i++) {
     PsbtError err = cross_check_input(i, mk);
     if (err != PsbtError::kNone) return err;
+    if (inputs_[i].witness_value_sats > kMaxMoneySats) return PsbtError::kMalformed;
     total_in += inputs_[i].witness_value_sats;
   }
 
@@ -665,6 +777,7 @@ PsbtError Psbt::validate(const MasterKey &mk, Network network,
     OutputInfo &info = out_summary->outputs[i];
     fill_output_info(i, mk, network, &info);
     if (info.address[0] == '\0') return PsbtError::kUnsupportedOutputScript;
+    if (info.amount_sats > kMaxMoneySats) return PsbtError::kMalformed;
 
     total_out += info.amount_sats;
     if (!info.is_change) {
@@ -672,17 +785,13 @@ PsbtError Psbt::validate(const MasterKey &mk, Network network,
     }
   }
   // Nota sobre rede (secao 9 do spec, "rede dos enderecos compativel"): uma
-  // scriptPubKey Bitcoin (segwit ou legada) NAO carrega nenhum byte de rede
-  // — o prefixo de rede (bc1/tb1, 0x00/0x6f, zpub/vpub etc.) e so uma
-  // convencao de como uma STRING de endereco e formatada, nao existe no
-  // script on-chain. Por isso nao ha nada para cruzar a partir do PSBT em
-  // si: a unica garantia possivel e que fill_output_info() acima sempre usa
-  // a rede da SESSAO (`network`) para formatar qualquer endereco exibido, o
-  // que ja e feito. Um PSBT de uma rede errada simplesmente produz
-  // assinaturas para um script que nao corresponde a nenhum UTXO real
-  // naquela rede — isso e um problema de uso (assinar o PSBT errado na
-  // sessao errada), nao algo detectavel aqui.
+  // scriptPubKey Bitcoin NAO carrega nenhum byte de rede (bc1/tb1 etc. e so
+  // formatacao da STRING de endereco). O unico sinal de rede no PSBT e o
+  // coin type alegado na derivacao (84'/0' vs 84'/1'), cruzado com a sessao
+  // em cross_check_input(); fill_output_info() formata tudo com a rede da
+  // sessao.
 
+  if (total_in > kMaxMoneySats || total_out > kMaxMoneySats) return PsbtError::kMalformed;
   if (total_in < total_out) return PsbtError::kAmountsDontBalance;
 
   out_summary->total_input_sats = total_in;

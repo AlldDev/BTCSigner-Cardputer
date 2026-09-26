@@ -1,5 +1,6 @@
 #include "keys.h"
 
+#include <cstdio>
 #include <cstring>
 
 extern "C" {
@@ -7,8 +8,13 @@ extern "C" {
 #include "curves.h"
 #include "ecdsa.h"
 #include "memzero.h"
+#include "options.h"
 #include "segwit_addr.h"
 }
+
+// mnemonic_to_seed() com cache copiaria mnemonico/passphrase/seed para um
+// buffer estatico que wipe_seed_material()/Session::end() nao alcancam.
+static_assert(USE_BIP39_CACHE == 0, "compile com -DUSE_BIP39_CACHE=0 (platformio.ini)");
 
 namespace btcseed {
 namespace {
@@ -16,6 +22,9 @@ namespace {
 // Versoes estendidas SLIP-132 para BIP84 (P2WPKH nativo).
 constexpr uint32_t kZpubVersionMainnet = 0x04b24746;
 constexpr uint32_t kVpubVersionTestnet = 0x045f1cf6;
+// Versoes BIP32 padrao, exigidas dentro de output descriptors.
+constexpr uint32_t kXpubVersionMainnet = 0x0488b21e;
+constexpr uint32_t kTpubVersionTestnet = 0x043587cf;
 
 const char *hrp_for_network(Network network) {
   return network == Network::kMainnet ? "bc" : "tb";
@@ -120,7 +129,9 @@ bool derive_address(const MasterKey &mk, uint32_t change, uint32_t index,
   return ok;
 }
 
-bool serialize_account_xpub(const MasterKey &mk, char *out, size_t out_len) {
+namespace {
+
+bool serialize_account_pub(const MasterKey &mk, uint32_t version, char *out, size_t out_len) {
   if (!mk.valid || out == nullptr) {
     return false;
   }
@@ -129,40 +140,77 @@ bool serialize_account_xpub(const MasterKey &mk, char *out, size_t out_len) {
     memzero(&node, sizeof(node));
     return false;
   }
-  size_t written = hdnode_serialize_public(
-      &node, mk.account_parent_fingerprint,
-      xpub_version_for_network(mk.network), out, out_len);
+  size_t written =
+      hdnode_serialize_public(&node, mk.account_parent_fingerprint, version, out, out_len);
   memzero(&node, sizeof(node));
   return written > 0;
 }
 
-bool find_change_index(const MasterKey &mk, const uint8_t pubkeyhash[20],
-                       uint32_t scan_limit, uint32_t *out_index) {
-  if (!mk.valid || pubkeyhash == nullptr || out_index == nullptr) {
-    return false;
-  }
-  for (uint32_t index = 0; index < scan_limit; index++) {
-    HDNode node;
-    if (!derive_child_node(mk, kChangeInternal, index, &node)) {
-      continue;
-    }
-    if (hdnode_fill_public_key(&node) != 0) {
-      wipe_node(&node);
-      continue;
-    }
-    uint8_t candidate[20];
-    ecdsa_get_pubkeyhash(node.public_key, node.curve->hasher_pubkey,
-                         candidate);
-    wipe_node(&node);
+uint64_t descriptor_polymod(uint64_t c, int val) {
+  uint8_t c0 = static_cast<uint8_t>(c >> 35);
+  c = ((c & 0x7ffffffffull) << 5) ^ static_cast<uint64_t>(val);
+  if (c0 & 1) c ^= 0xf5dee51989ull;
+  if (c0 & 2) c ^= 0xa9fdca3312ull;
+  if (c0 & 4) c ^= 0x1bab10e32dull;
+  if (c0 & 8) c ^= 0x3706b1677aull;
+  if (c0 & 16) c ^= 0x644d626ffdull;
+  return c;
+}
 
-    bool match = memcmp(candidate, pubkeyhash, sizeof(candidate)) == 0;
-    memzero(candidate, sizeof(candidate));
-    if (match) {
-      *out_index = index;
-      return true;
+} // namespace
+
+bool serialize_account_xpub(const MasterKey &mk, char *out, size_t out_len) {
+  return serialize_account_pub(mk, xpub_version_for_network(mk.network), out, out_len);
+}
+
+// Algoritmo de referencia do BIP380 (DescriptorChecksum do Bitcoin Core).
+bool descriptor_checksum(const char *desc, char out[9]) {
+  static const char kInputCharset[] =
+      "0123456789()[],'/*abcdefgh@:$%{}"
+      "IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~"
+      "ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ";
+  static const char kChecksumCharset[] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+  if (desc == nullptr || out == nullptr) return false;
+
+  uint64_t c = 1;
+  int cls = 0;
+  int cls_count = 0;
+  for (const char *p = desc; *p != '\0'; p++) {
+    const char *hit = strchr(kInputCharset, *p);
+    if (hit == nullptr) return false;
+    int pos = static_cast<int>(hit - kInputCharset);
+    c = descriptor_polymod(c, pos & 31);
+    cls = cls * 3 + (pos >> 5);
+    if (++cls_count == 3) {
+      c = descriptor_polymod(c, cls);
+      cls = 0;
+      cls_count = 0;
     }
   }
-  return false;
+  if (cls_count > 0) c = descriptor_polymod(c, cls);
+  for (int j = 0; j < 8; j++) c = descriptor_polymod(c, 0);
+  c ^= 1;
+  for (int j = 0; j < 8; j++) out[j] = kChecksumCharset[(c >> (5 * (7 - j))) & 31];
+  out[8] = '\0';
+  return true;
+}
+
+bool build_descriptor(const MasterKey &mk, uint32_t change, char *out, size_t out_len) {
+  if (out == nullptr) return false;
+  char xpub[XPUB_MAXLEN];
+  uint32_t version =
+      mk.network == Network::kMainnet ? kXpubVersionMainnet : kTpubVersionTestnet;
+  if (!serialize_account_pub(mk, version, xpub, sizeof(xpub))) return false;
+  char fp[9];
+  format_fingerprint(mk.master_fingerprint, fp);
+  int n = snprintf(out, out_len, "wpkh([%s/84h/%dh/0h]%s/%lu/*)", fp,
+                   mk.network == Network::kMainnet ? 0 : 1, xpub,
+                   static_cast<unsigned long>(change));
+  if (n <= 0 || static_cast<size_t>(n) + 9 >= out_len) return false; // + "#" + 8 chars
+  char sum[9];
+  if (!descriptor_checksum(out, sum)) return false;
+  snprintf(out + n, out_len - n, "#%s", sum);
+  return true;
 }
 
 void wipe_node(HDNode *node) {

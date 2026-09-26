@@ -29,6 +29,53 @@ static void test_format_address_grouped_respects_capacity(void) {
   TEST_ASSERT_FALSE(format_address_grouped("bc1qcr8te4kr609gcawu", tiny, sizeof(tiny)));
 }
 
+// Quebra `text` em linhas de ate max_chars, confere que nenhuma passa do
+// limite e que, sem os espacos, as linhas reproduzem `expected` inteiro.
+static int wrap_and_check(const char *text, size_t max_chars, const char *expected) {
+  char joined[160] = {0};
+  size_t j = 0;
+  size_t pos = 0, start = 0, n = 0;
+  int lines = 0;
+  while (wrap_next_line(text, &pos, max_chars, &start, &n)) {
+    TEST_ASSERT_TRUE(n <= max_chars);
+    TEST_ASSERT_TRUE(n > 0);
+    for (size_t i = 0; i < n; i++) {
+      if (text[start + i] != ' ') joined[j++] = text[start + i];
+    }
+    lines++;
+  }
+  joined[j] = '\0';
+  TEST_ASSERT_EQUAL_STRING(expected, joined);
+  return lines;
+}
+
+static void test_wrap_never_drops_address_chars(void) {
+  const char *p2wpkh = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";            // 42
+  const char *p2tr = "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297"; // 62
+  const char *p2pkh = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";                      // 34
+  char grouped[100];
+
+  // 29 chars/linha = fonte 8x16 na tela; 38 = fonte 6x8.
+  TEST_ASSERT_TRUE(format_address_grouped(p2wpkh, grouped, sizeof(grouped)));
+  TEST_ASSERT_EQUAL_INT(2, wrap_and_check(grouped, 29, p2wpkh));
+  TEST_ASSERT_EQUAL_INT(2, wrap_and_check(grouped, 38, p2wpkh));
+
+  TEST_ASSERT_TRUE(format_address_grouped(p2tr, grouped, sizeof(grouped)));
+  TEST_ASSERT_EQUAL_INT(3, wrap_and_check(grouped, 29, p2tr));
+  TEST_ASSERT_EQUAL_INT(3, wrap_and_check(grouped, 38, p2tr));
+
+  TEST_ASSERT_TRUE(format_address_grouped(p2pkh, grouped, sizeof(grouped)));
+  TEST_ASSERT_EQUAL_INT(2, wrap_and_check(grouped, 29, p2pkh));
+}
+
+static void test_wrap_hard_breaks_text_without_spaces(void) {
+  // zpub: 111 chars sem espaco -> corte duro, nada perdido.
+  const char *zpub =
+      "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs";
+  TEST_ASSERT_EQUAL_INT(4, wrap_and_check(zpub, 29, zpub));
+  TEST_ASSERT_EQUAL_INT(0, wrap_and_check("   ", 29, ""));
+}
+
 static void test_format_btc(void) {
   char out[24];
   TEST_ASSERT_TRUE(format_btc(50000, out, sizeof(out)));
@@ -85,6 +132,20 @@ static void test_build_output_review_flags_forged_change(void) {
   TEST_ASSERT_FALSE(text.is_change);
 }
 
+static void test_build_output_review_propagates_change_index(void) {
+  OutputInfo info;
+  strncpy(info.address, "bc1qchange", sizeof(info.address) - 1);
+  info.is_change = true;
+  info.change_index = 5000;
+  info.change_index_high = true;
+
+  OutputReviewText text;
+  build_output_review(info, &text);
+  TEST_ASSERT_TRUE(text.is_change);
+  TEST_ASSERT_EQUAL_UINT32(5000, text.change_index);
+  TEST_ASSERT_TRUE(text.change_index_high);
+}
+
 static void test_build_fee_review(void) {
   PsbtSummary summary{};
   summary.num_inputs = 1;
@@ -120,11 +181,14 @@ int main(int argc, char **argv) {
   RUN_TEST(test_format_address_grouped);
   RUN_TEST(test_format_address_grouped_short);
   RUN_TEST(test_format_address_grouped_respects_capacity);
+  RUN_TEST(test_wrap_never_drops_address_chars);
+  RUN_TEST(test_wrap_hard_breaks_text_without_spaces);
   RUN_TEST(test_format_btc);
   RUN_TEST(test_format_sats);
   RUN_TEST(test_estimate_vbytes);
   RUN_TEST(test_build_output_review);
   RUN_TEST(test_build_output_review_flags_forged_change);
+  RUN_TEST(test_build_output_review_propagates_change_index);
   RUN_TEST(test_build_fee_review);
   RUN_TEST(test_build_fee_review_propagates_high_fee_warning);
   return UNITY_END();

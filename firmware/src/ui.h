@@ -1,27 +1,31 @@
 // Primitivas de desenho e leitura do teclado do M5Cardputer. So isso —
 // nenhuma logica de fluxo/estado das telas mora aqui (isso e main.cpp).
 //
-// So compila no ambiente `cardputer` (depende de M5Cardputer/M5GFX). API
-// baseada nos exemplos oficiais de M5Cardputer 1.1.1 (M5Cardputer.begin,
-// M5Cardputer.Keyboard.{isChange,isPressed,keysState}, M5Cardputer.Display).
-// Ainda NAO compilado contra o hardware real nesta sessao — ver README.md.
+// So compila no ambiente `cardputer` (depende de M5Cardputer/M5GFX). O visual
+// (paleta, header/rodape, abas, linhas de lista, caixa de entrada, barras,
+// icones) segue o design "Bitcoin Signer IoT Interface" do claude.ai/design
+// (Cardputer PSBT Signer.dc.html / Screen.dc.html), 240x135 px.
+//
+// Textos: so ASCII. A fonte 6x8 do M5GFX nao tem acentos nem setas.
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace btcseed {
 
 // Evento de teclado de uma iteracao do loop (ver ui_poll_key).
 //
-// O teclado fisico do Cardputer NAO TEM tecla Esc nem setas dedicadas (a
-// struct real da lib so expoe tab/fn/shift/ctrl/opt/alt/del/enter/space +
-// os caracteres imprimiveis em `word` — confirmado lendo
+// A lib do Cardputer NAO expoe Esc nem setas como sinais proprios (a
+// struct real so tem tab/fn/shift/ctrl/opt/alt/del/enter/space + os
+// caracteres imprimiveis em `word` — confirmado lendo
 // M5Cardputer/src/utility/Keyboard/Keyboard.h da versao pinada, nao supondo
 // API). Duas convencoes deste firmware compensam isso:
 //
-//   - "Cancelar" = Ctrl+C, detectado aqui (universal, nao depende do
-//     estado da tela) — nao conflita com a passphrase livre porque Ctrl
-//     nunca e como alguem digitaria um 'C' de verdade (isso e Shift+c).
+//   - "Voltar/Cancelar" = tecla ESC (canto superior esquerdo, serigrafada
+//     "ESC", que a lib entrega como '`'), detectada aqui para todas as
+//     telas. Como '`' tambem e caractere valido de passphrase, Fn+` entrega
+//     o '`' literal em `ch` em vez de Esc.
 //   - "Setas" nao existem como sinal proprio: as teclas fisicas ; , . /
 //     tem setas serigrafadas (uso pretendido pela propria M5Stack), mas
 //     como sao caracteres imprimiveis validos (podem aparecer numa
@@ -30,7 +34,7 @@ namespace btcseed {
 //     daqui.
 struct KeyEvent {
   bool has_event = false; // houve alguma tecla pressionada nesta iteracao
-  bool esc = false;       // Ctrl+C
+  bool esc = false;       // tecla ESC ('`' sem Fn)
   bool enter = false;
   bool backspace = false; // "del" na API da lib (unica tecla de apagar)
   bool tab = false;
@@ -46,47 +50,98 @@ constexpr char kKeyLeft = ',';
 constexpr char kKeyDown = '.';
 constexpr char kKeyRight = '/';
 
-enum class TextStyle {
-  kNormal,
-  kHighlighted, // selecao atual (ex: candidato de autocomplete, item de menu)
-  kWarning,     // aviso destacado (taxa alta, troco nao verificado)
-  kMuted,       // texto secundario
+// Paleta do design, em RGB565.
+namespace color {
+constexpr uint16_t kOrange = 0xF483;     // #F7931A
+constexpr uint16_t kBg = 0x0841;         // #0B0B0C
+constexpr uint16_t kSurface = 0x1082;    // #121214
+constexpr uint16_t kLine = 0x18E4;       // #1E1E22
+constexpr uint16_t kText = 0xF79E;       // #F2F2F2
+constexpr uint16_t kMuted = 0x8C52;      // #8A8A90
+constexpr uint16_t kTabIdle = 0x6B4E;    // #6A6A70
+constexpr uint16_t kOk = 0x3EF0;         // #3DDC84
+constexpr uint16_t kError = 0xFA69;      // #FF4D4D
+constexpr uint16_t kOnOrangeDim = 0x4940; // #4A2A05, texto secundario sobre laranja
+} // namespace color
+
+enum class Font {
+  kSmall, // 6x8 do M5GFX (header, rodape, rotulos secundarios)
+  kBody,  // AsciiFont8x16, monoespacada (conteudo principal, enderecos)
+  kBig,   // FreeMonoBold12pt7b (valor em BTC)
+  kTitle, // FreeMonoBold9pt7b (titulos centrais)
 };
+enum class Align { kLeft, kCenter, kRight };
+enum class HeaderNet { kNone, kMainnet, kTestnet };
 
-// --- ciclo de vida ---
+// Geometria fixa: header 0..14, corpo kBodyTop..kBodyBottom, rodape abaixo.
+constexpr int kScreenW = 240;
+constexpr int kScreenH = 135;
+constexpr int kBodyTop = 15;
+constexpr int kBodyBottom = 122;
+constexpr int kTabsH = 15;
+constexpr int kMargin = 4; // margem lateral do conteudo em kBody (29 chars/linha)
 
-// Inicializa M5Cardputer (tela + teclado) e configura a tela (rotacao
-// paisagem, fonte, cores). Chamar uma vez em setup().
+// --- ciclo de vida / teclado ---
+
+// Inicializa M5Cardputer (tela + teclado). Chamar uma vez em setup().
 void ui_init();
 
-// Deve ser chamado uma vez por iteracao do loop principal, antes de
-// ui_poll_key().
+// Uma vez por iteracao do loop, antes de ui_poll_key()/ui_enter_held().
 void ui_update();
 
-// Preenche `out` com o estado do teclado desta iteracao. Retorna
-// out->has_event (conveniencia). So reflete mudancas de estado (uma tecla
-// pressionada uma vez gera um evento, nao um por frame enquanto segurada).
+// Preenche `out` com a tecla pressionada nesta iteracao. So reflete a borda
+// de pressao (uma tecla segurada gera um evento, nao um por frame).
 bool ui_poll_key(KeyEvent *out);
+
+// Enter esta fisicamente pressionado AGORA (para "segure Enter").
+bool ui_enter_held();
+
+// 0-255.
+void ui_set_brightness(uint8_t level);
 
 // --- desenho ---
 
-// Define o texto de uma faixa persistente no topo da tela (ex: "TESTNET",
-// secao 8 do spec — deve ficar visivel a sessao toda). nullptr ou "" remove
-// a faixa. ui_clear() sempre redesenha a faixa atual, se houver, para que
-// nenhuma tela precise se lembrar de faz-lo.
-void ui_set_persistent_banner(const char *text);
+// Estado mostrado no header de toda tela com chrome. kTestnet aparece em
+// vermelho e cumpre o indicador persistente de rede da secao 8 do spec.
+void ui_set_header_status(HeaderNet net, bool sd_ok);
 
-// Limpa a tela e redesenha a faixa persistente (se houver).
+// Limpa a tela e desenha header (titulo) + rodape (dica a esquerda em cinza,
+// acao a direita em laranja). nullptr = vazio.
+// ponytail: redesenho direto na tela (pode piscar); trocar por um M5Canvas
+// 240x135 se o flicker incomodar no hardware.
+void ui_begin_screen(const char *title, const char *foot_left, const char *foot_right);
+
+// Tela cheia sem header/rodape (boot).
 void ui_clear();
 
-// Desenha uma "linha" de texto numa grade fixa de altura kLineHeightPx,
-// numerada a partir de 0 logo abaixo da faixa persistente (se houver).
-void ui_draw_line(int line, const char *text, TextStyle style = TextStyle::kNormal);
+void ui_fill(int x, int y, int w, int h, uint16_t c);
+void ui_text(int x, int y, const char *text, uint16_t c, Font font = Font::kSmall,
+             Align align = Align::kLeft);
+int ui_text_width(const char *text, Font font = Font::kSmall);
 
-int ui_width();
-int ui_height();
-// Quantas linhas de texto cabem na tela (considerando a faixa persistente,
-// se houver) — util para quem pagina listas longas (menu, PSBTs, outputs).
-int ui_max_lines();
+// Quebra `text` em linhas de ate `w` px (wrap_next_line, preferindo espacos,
+// nunca descarta caractere). Retorna o y logo abaixo da ultima linha. Com
+// draw=false so mede. So kSmall/kBody (monoespacadas).
+int ui_text_wrapped(int x, int y, int w, const char *text, uint16_t c,
+                    Font font = Font::kSmall, bool draw = true);
+
+// Linha de lista em kBody: fundo laranja + texto escuro quando selecionada.
+void ui_row(int y, int h, const char *left, const char *right, bool selected,
+            uint16_t right_color = color::kMuted);
+
+// Barra de abas de kTabsH px, com sublinhado laranja na aba ativa.
+void ui_tabs(int y, const char *const *labels, int n, int active);
+
+// Caixa de entrada de 24 px com cursor em bloco. Se `text` nao cabe, mostra
+// o final. Borda vermelha se `error`.
+void ui_input_box(int x, int y, int w, const char *text, bool error);
+
+// Barra de progresso 0-100. Com `label`: borda laranja e texto que inverte
+// de cor na parte preenchida. Sem label: trilho cinza fino.
+void ui_progress(int x, int y, int w, int h, int pct, const char *label);
+
+void ui_icon_ok(int cx, int cy);
+void ui_icon_error(int cx, int cy);
+void ui_logo(int cx, int cy);
 
 } // namespace btcseed

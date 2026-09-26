@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Laboratório PSBT - Bitcoin Testnet4</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d29;
+    --border: #2a2e3f;
+    --text: #e6e8f0;
+    --muted: #8b8fa3;
+    --accent: #f7931a;
+    --accent-dark: #c9761a;
+    --green: #3ecf8e;
+    --red: #ef5350;
+    --mono: 'Courier New', monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    margin: 0;
+    padding: 24px 16px 60px;
+  }
+  .container { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
+  .aviso {
+    background: rgba(247, 147, 26, 0.1);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  .card h2 {
+    font-size: 1rem;
+    margin: 0 0 14px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card h2 .num {
+    background: var(--accent);
+    color: #1a1200;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: bold;
+  }
+  label {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-bottom: 4px;
+    margin-top: 12px;
+  }
+  label:first-child { margin-top: 0; }
+  input, textarea {
+    width: 100%;
+    background: #0d0f16;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 9px 10px;
+    border-radius: 8px;
+    font-family: var(--mono);
+    font-size: 0.85rem;
+  }
+  textarea { resize: vertical; min-height: 70px; }
+  button {
+    background: var(--accent);
+    color: #1a1200;
+    border: none;
+    padding: 9px 16px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.85rem;
+    cursor: pointer;
+    margin-top: 12px;
+    margin-right: 8px;
+  }
+  button:hover { background: var(--accent-dark); }
+  button.secundario {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  button.secundario:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .campo-valor {
+    font-family: var(--mono);
+    word-break: break-all;
+    background: #0d0f16;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    font-size: 0.8rem;
+    margin-top: 8px;
+  }
+  .linha { display: flex; gap: 12px; flex-wrap: wrap; }
+  .linha > div { flex: 1; min-width: 140px; }
+  .status { font-size: 0.85rem; margin-top: 10px; }
+  .status.ok { color: var(--green); }
+  .status.erro { color: var(--red); }
+  .utxo-item {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-top: 6px;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  a { color: var(--accent); }
+  .oculto { display: none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Laboratório PSBT — Bitcoin Testnet4</h1>
+  <div class="subtitle">Um arquivo único: carteira, criação de transação, exportação/importação de PSBT e transmissão via mempool.space</div>
+  <div class="aviso">
+    Ferramenta apenas para testes em testnet4. A mnemônica fica só no seu navegador (localStorage).
+    Nunca use este código ou esta chave em mainnet.
+  </div>
+
+  <!-- 1. CARTEIRA -->
+  <div class="card">
+    <h2><span class="num">1</span> Carteira</h2>
+    <div id="semCarteira">
+      <button onclick="gerarCarteira()">Gerar nova carteira</button>
+      <button class="secundario" onclick="document.getElementById('boxImportar').classList.toggle('oculto')">Importar mnemônica</button>
+      <div id="boxImportar" class="oculto">
+        <label>Mnemônica BIP39 (12 ou 24 palavras)</label>
+        <input type="text" id="mnemonicaImportar" placeholder="abandon ability able ...">
+        <button onclick="importarCarteira()">Importar</button>
+      </div>
+    </div>
+    <div id="comCarteira" class="oculto">
+      <label>Mnemônica BIP39 — digite no Cardputer (sem passphrase, rede TESTNET)</label>
+      <div class="campo-valor" id="mnemonicaCarteira"></div>
+      <label>Master fingerprint — deve bater com o mostrado no Cardputer</label>
+      <div class="campo-valor" id="fingerprintCarteira"></div>
+      <label>Endereço m/84'/1'/0'/0/0 (P2WPKH / bech32)</label>
+      <div class="campo-valor" id="enderecoCarteira"></div>
+      <button class="secundario" onclick="esquecerCarteira()">Esquecer carteira deste navegador</button>
+    </div>
+  </div>
+
+  <!-- 2. SALDO / UTXOs -->
+  <div class="card oculto" id="cardSaldo">
+    <h2><span class="num">2</span> Saldo (mempool.space testnet4)</h2>
+    <button onclick="atualizarUtxos()">Atualizar saldo e UTXOs</button>
+    <div class="campo-valor" id="saldoTotal">Saldo: --</div>
+    <div id="listaUtxos"></div>
+    <div class="status" id="statusUtxos"></div>
+  </div>
+
+  <!-- 3. CRIAR TRANSACAO / PSBT -->
+  <div class="card oculto" id="cardCriar">
+    <h2><span class="num">3</span> Criar transação (PSBT não assinado)</h2>
+    <label>Endereço de destino</label>
+    <input type="text" id="destino" placeholder="tb1q...">
+    <div class="linha">
+      <div>
+        <label>Valor a enviar (satoshis)</label>
+        <input type="number" id="valorSats" placeholder="50000">
+      </div>
+      <div>
+        <label>Taxa (satoshis)</label>
+        <input type="number" id="feeSats" value="300">
+      </div>
+    </div>
+    <button onclick="criarPsbt()">Gerar PSBT não assinado</button>
+    <div id="resultadoPsbtCriado" class="oculto">
+      <label>PSBT (base64) — copie, baixe ou leve para assinar externamente</label>
+      <textarea id="psbtGeradoBase64" readonly></textarea>
+      <button class="secundario" onclick="copiarTexto('psbtGeradoBase64')">Copiar</button>
+      <button class="secundario" onclick="baixarPsbt('psbtGeradoBase64','unsigned.psbt')">Baixar .psbt</button>
+    </div>
+    <div class="status" id="statusCriar"></div>
+  </div>
+
+  <!-- 4. ASSINAR -->
+  <div class="card oculto" id="cardAssinar">
+    <h2><span class="num">4</span> Assinar</h2>
+    <label>Cole aqui o PSBT a assinar (o gerado acima, ou um importado de arquivo)</label>
+    <textarea id="psbtParaAssinar"></textarea>
+    <input type="file" id="arquivoPsbtAssinar" accept=".psbt,.txt" onchange="carregarArquivoPsbt(this,'psbtParaAssinar')">
+    <br>
+    <button onclick="assinarComEstaCarteira()">Assinar com esta carteira (modo teste rápido)</button>
+    <div class="status" id="statusAssinar"></div>
+    <div id="resultadoPsbtAssinado" class="oculto">
+      <label>PSBT assinado (base64)</label>
+      <textarea id="psbtAssinadoBase64" readonly></textarea>
+      <button class="secundario" onclick="copiarTexto('psbtAssinadoBase64')">Copiar</button>
+      <button class="secundario" onclick="baixarPsbt('psbtAssinadoBase64','signed.psbt')">Baixar .psbt</button>
+      <button onclick="usarNaTransmissao()">Usar este PSBT na etapa 5</button>
+    </div>
+  </div>
+
+  <!-- 5. FINALIZAR E TRANSMITIR -->
+  <div class="card oculto" id="cardTransmitir">
+    <h2><span class="num">5</span> Finalizar e transmitir</h2>
+    <label>PSBT assinado (base64) — importado de arquivo ou hardwallet externo</label>
+    <textarea id="psbtParaTransmitir"></textarea>
+    <input type="file" id="arquivoPsbtTransmitir" accept=".psbt,.txt" onchange="carregarArquivoPsbt(this,'psbtParaTransmitir')">
+    <br>
+    <button onclick="finalizarETransmitir()">Finalizar e transmitir para testnet4</button>
+    <div class="status" id="statusTransmitir"></div>
+  </div>
+
+</div>
+
+<script type="module">
+// bitcoinjs-lib nao publica bundle de browser; esm.sh empacota. v5/v6 quebram no browser (deps create-hash/cipher-base).
+import * as bitcoin from 'https://esm.sh/bitcoinjs-lib@7.0.0';
+import { ECPairFactory } from 'https://esm.sh/ecpair@3.0.0';
+import * as ecc from 'https://esm.sh/@bitcoinerlab/secp256k1@1.2.0';
+bitcoin.initEccLib(ecc);
+import * as bip39 from 'https://esm.sh/@scure/bip39@1.6.0';
+import { wordlist } from 'https://esm.sh/@scure/bip39@1.6.0/wordlists/english';
+import { HDKey } from 'https://esm.sh/@scure/bip32@1.7.0';
+const ECPair = ECPairFactory(ecc);
+
+const REDE = bitcoin.networks.testnet;
+const API_BASE = 'https://mempool.space/testnet4/api';
+// BIP84 testnet, igual ao firmware. Recebe e recebe troco no mesmo endereco (o firmware aceita change 0 ou 1).
+const CAMINHO = "m/84'/1'/0'/0/0";
+const CHAVE_STORAGE = 'psbt_lab_carteira_v2';
+
+let carteira = null; // { mnemonic, address, fingerprint (Uint8Array 4), pubkey, privateKey }
+let utxosCarregados = [];
+
+function derivarCarteira(mnemonic) {
+  if (!bip39.validateMnemonic(mnemonic, wordlist)) throw new Error('mnemônica inválida');
+  const raiz = HDKey.fromMasterSeed(bip39.mnemonicToSeedSync(mnemonic));
+  const filho = raiz.derive(CAMINHO);
+  const fingerprint = new Uint8Array(4);
+  new DataView(fingerprint.buffer).setUint32(0, raiz.fingerprint);
+  const { address } = bitcoin.payments.p2wpkh({ pubkey: filho.publicKey, network: REDE });
+  return { mnemonic, address, fingerprint, pubkey: filho.publicKey, privateKey: filho.privateKey };
+}
+
+function derivacaoBip32() {
+  return [{ masterFingerprint: carteira.fingerprint, path: CAMINHO, pubkey: carteira.pubkey }];
+}
+
+function salvarCarteiraLocal() {
+  localStorage.setItem(CHAVE_STORAGE, carteira.mnemonic);
+}
+
+function carregarCarteiraLocal() {
+  const mnemonic = localStorage.getItem(CHAVE_STORAGE);
+  if (mnemonic) {
+    carteira = derivarCarteira(mnemonic);
+    exibirCarteira();
+  }
+}
+
+function exibirCarteira() {
+  document.getElementById('semCarteira').classList.add('oculto');
+  document.getElementById('comCarteira').classList.remove('oculto');
+  document.getElementById('mnemonicaCarteira').textContent = carteira.mnemonic;
+  document.getElementById('fingerprintCarteira').textContent =
+    Array.from(carteira.fingerprint, b => b.toString(16).padStart(2, '0')).join('');
+  document.getElementById('enderecoCarteira').textContent = carteira.address;
+  document.getElementById('cardSaldo').classList.remove('oculto');
+  document.getElementById('cardCriar').classList.remove('oculto');
+  document.getElementById('cardAssinar').classList.remove('oculto');
+  document.getElementById('cardTransmitir').classList.remove('oculto');
+}
+
+function gerarCarteira() {
+  carteira = derivarCarteira(bip39.generateMnemonic(wordlist, 128));
+  salvarCarteiraLocal();
+  exibirCarteira();
+}
+
+function importarCarteira() {
+  const mnemonic = document.getElementById('mnemonicaImportar').value.trim().toLowerCase().split(/\s+/).join(' ');
+  try {
+    carteira = derivarCarteira(mnemonic);
+    salvarCarteiraLocal();
+    exibirCarteira();
+  } catch (erro) {
+    alert('Erro ao importar: ' + erro.message);
+  }
+}
+
+function esquecerCarteira() {
+  if (!confirm('Isso apaga a chave privada salva neste navegador. Continuar?')) return;
+  localStorage.removeItem(CHAVE_STORAGE);
+  carteira = null;
+  location.reload();
+}
+
+async function atualizarUtxos() {
+  const statusEl = document.getElementById('statusUtxos');
+  statusEl.textContent = 'Buscando UTXOs...';
+  statusEl.className = 'status';
+  try {
+    const resp = await fetch(`${API_BASE}/address/${carteira.address}/utxo`);
+    if (!resp.ok) throw new Error('Resposta HTTP ' + resp.status);
+    utxosCarregados = await resp.json();
+
+    const total = utxosCarregados.reduce((soma, u) => soma + u.value, 0);
+    document.getElementById('saldoTotal').textContent =
+      `Saldo: ${total} sats (${(total / 1e8).toFixed(8)} tBTC) em ${utxosCarregados.length} UTXO(s)`;
+
+    const listaEl = document.getElementById('listaUtxos');
+    listaEl.innerHTML = '';
+    utxosCarregados.forEach(u => {
+      const div = document.createElement('div');
+      div.className = 'utxo-item';
+      div.innerHTML = `<span>${u.txid.slice(0, 16)}...:${u.vout}</span><span>${u.value} sats</span>`;
+      listaEl.appendChild(div);
+    });
+
+    statusEl.textContent = 'Atualizado com sucesso.';
+    statusEl.className = 'status ok';
+  } catch (erro) {
+    statusEl.textContent = 'Erro ao buscar UTXOs: ' + erro.message;
+    statusEl.className = 'status erro';
+  }
+}
+
+// Tx que criou o UTXO: o Cardputer exige (PSBT_IN_NON_WITNESS_UTXO) para provar o valor do input.
+async function buscarTxAnterior(txid) {
+  const resp = await fetch(`${API_BASE}/tx/${txid}/hex`);
+  if (!resp.ok) throw new Error(`tx anterior ${txid.slice(0, 16)}...: HTTP ${resp.status}`);
+  const hex = (await resp.text()).trim();
+  return Uint8Array.from(hex.match(/../g), h => parseInt(h, 16));
+}
+
+async function criarPsbt() {
+  const statusEl = document.getElementById('statusCriar');
+  const destino = document.getElementById('destino').value.trim();
+  const valorSats = parseInt(document.getElementById('valorSats').value, 10);
+  const feeSats = parseInt(document.getElementById('feeSats').value, 10) || 0;
+
+  if (!destino || !valorSats) {
+    statusEl.textContent = 'Preencha o destino e o valor.';
+    statusEl.className = 'status erro';
+    return;
+  }
+  if (utxosCarregados.length === 0) {
+    statusEl.textContent = 'Nenhum UTXO carregado. Clique em "Atualizar saldo e UTXOs" primeiro.';
+    statusEl.className = 'status erro';
+    return;
+  }
+
+  try {
+    const psbt = new bitcoin.Psbt({ network: REDE });
+    const scriptOrigem = bitcoin.address.toOutputScript(carteira.address, REDE);
+
+    let totalEntrada = 0;
+    const necessario = valorSats + feeSats;
+    for (const utxo of utxosCarregados) {
+      psbt.addInput({
+        hash: utxo.txid,
+        index: utxo.vout,
+        witnessUtxo: { script: scriptOrigem, value: BigInt(utxo.value) },
+        nonWitnessUtxo: await buscarTxAnterior(utxo.txid),
+        bip32Derivation: derivacaoBip32() // o Cardputer recusa input sem isso
+      });
+      totalEntrada += utxo.value;
+      if (totalEntrada >= necessario) break;
+    }
+
+    if (totalEntrada < necessario) {
+      statusEl.textContent = `Saldo insuficiente: disponível ${totalEntrada} sats, necessário ${necessario} sats.`;
+      statusEl.className = 'status erro';
+      return;
+    }
+
+    psbt.addOutput({ address: destino, value: BigInt(valorSats) });
+
+    const troco = totalEntrada - necessario;
+    if (troco > 546) {
+      // com a derivacao o Cardputer mostra "Troco (verificado)"
+      psbt.addOutput({ address: carteira.address, value: BigInt(troco), bip32Derivation: derivacaoBip32() });
+    }
+
+    const base64 = psbt.toBase64();
+    document.getElementById('psbtGeradoBase64').value = base64;
+    document.getElementById('resultadoPsbtCriado').classList.remove('oculto');
+    document.getElementById('psbtParaAssinar').value = base64;
+
+    statusEl.textContent = `PSBT criado com ${psbt.inputCount} entrada(s). Troco: ${troco > 546 ? troco + ' sats' : 'nenhum (abaixo do limite de poeira)'}.`;
+    statusEl.className = 'status ok';
+  } catch (erro) {
+    statusEl.textContent = 'Erro ao montar o PSBT: ' + erro.message;
+    statusEl.className = 'status erro';
+  }
+}
+
+function assinarComEstaCarteira() {
+  const statusEl = document.getElementById('statusAssinar');
+  const base64 = document.getElementById('psbtParaAssinar').value.trim();
+  if (!base64) {
+    statusEl.textContent = 'Cole ou gere um PSBT primeiro.';
+    statusEl.className = 'status erro';
+    return;
+  }
+  try {
+    const par = ECPair.fromPrivateKey(carteira.privateKey, { network: REDE });
+    const psbt = bitcoin.Psbt.fromBase64(base64, { network: REDE });
+
+    for (let i = 0; i < psbt.inputCount; i++) {
+      psbt.signInput(i, par);
+    }
+    const ok = psbt.validateSignaturesOfAllInputs(
+      (pubkey, hash, sig) => ECPair.fromPublicKey(pubkey).verify(hash, sig));
+    if (!ok) throw new Error('assinatura inválida');
+
+    const assinadoBase64 = psbt.toBase64();
+    document.getElementById('psbtAssinadoBase64').value = assinadoBase64;
+    document.getElementById('resultadoPsbtAssinado').classList.remove('oculto');
+
+    statusEl.textContent = 'PSBT assinado com sucesso.';
+    statusEl.className = 'status ok';
+  } catch (erro) {
+    statusEl.textContent = 'Erro ao assinar: ' + erro.message;
+    statusEl.className = 'status erro';
+  }
+}
+
+function usarNaTransmissao() {
+  const base64 = document.getElementById('psbtAssinadoBase64').value;
+  document.getElementById('psbtParaTransmitir').value = base64;
+  document.getElementById('cardTransmitir').scrollIntoView({ behavior: 'smooth' });
+}
+
+async function finalizarETransmitir() {
+  const statusEl = document.getElementById('statusTransmitir');
+  const base64 = document.getElementById('psbtParaTransmitir').value.trim();
+  if (!base64) {
+    statusEl.textContent = 'Cole o PSBT assinado primeiro.';
+    statusEl.className = 'status erro';
+    return;
+  }
+  try {
+    const psbt = bitcoin.Psbt.fromBase64(base64, { network: REDE });
+    psbt.finalizeAllInputs();
+    const txHex = psbt.extractTransaction().toHex();
+
+    statusEl.textContent = 'Transmitindo para a rede testnet4...';
+    statusEl.className = 'status';
+
+    const resp = await fetch(`${API_BASE}/tx`, { method: 'POST', body: txHex });
+    const texto = await resp.text();
+
+    if (!resp.ok) throw new Error(texto);
+
+    statusEl.innerHTML = `Transação transmitida! Txid: <a href="https://mempool.space/testnet4/tx/${texto}" target="_blank">${texto}</a>`;
+    statusEl.className = 'status ok';
+  } catch (erro) {
+    statusEl.textContent = 'Erro ao finalizar/transmitir: ' + erro.message;
+    statusEl.className = 'status erro';
+  }
+}
+
+function copiarTexto(idElemento) {
+  const el = document.getElementById(idElemento);
+  el.select();
+  navigator.clipboard.writeText(el.value);
+}
+
+function baixarPsbt(idElemento, nomeArquivo) {
+  const conteudo = document.getElementById(idElemento).value;
+  const blob = new Blob([conteudo], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = nomeArquivo;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function carregarArquivoPsbt(input, idDestino) {
+  const arquivo = input.files[0];
+  if (!arquivo) return;
+  const leitor = new FileReader();
+  leitor.onload = e => { document.getElementById(idDestino).value = e.target.result.trim(); };
+  leitor.readAsText(arquivo);
+}
+
+// modulo nao expoe funcoes no escopo global; os onclick precisam delas
+Object.assign(window, { gerarCarteira, importarCarteira, esquecerCarteira, atualizarUtxos, criarPsbt,
+  assinarComEstaCarteira, usarNaTransmissao, finalizarETransmitir, copiarTexto, baixarPsbt, carregarArquivoPsbt });
+
+carregarCarteiraLocal();
+</script>
+</body>
+</html>
