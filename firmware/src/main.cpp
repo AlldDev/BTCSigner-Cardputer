@@ -21,12 +21,15 @@
 #include "passphrase_input.h"
 #include "psbt.h"
 #include "review_screens.h"
+#include "rfid_io.h"
+#include "rfid_seed_card.h"
 #include "sd_io.h"
 #include "session.h"
 #include "ui.h"
 
 extern "C" {
-#include "bip39.h" // BIP39_MAX_MNEMONIC_LEN
+#include "bip39.h" // BIP39_MAX_MNEMONIC_LEN, mnemonic_clear
+#include "consteq.h"
 #include "memzero.h"
 }
 
@@ -41,6 +44,12 @@ enum class State {
   kChecksumFailed,
   kPassphraseEntry,
   kFingerprintConfirm,
+  kBackupOffer,            // gravar backup cifrado no cartao RFID? (opt-in)
+  kBackupPassword,         // senha do cartao
+  kBackupPasswordConfirm,  // mesma senha de novo
+  kBackupOverwriteConfirm, // cartao ja tem dados
+  kBackupResult,
+  kRestorePassword, // senha do cartao lido em "Restaurar do cartao"
   kMainMenu, // abas ASSINAR / CARTEIRA / SESSAO
   kPsbtReviewOutput,
   kPsbtReviewFee,
@@ -79,6 +88,18 @@ MasterKey g_pending_mk;
 uint32_t g_last_key_ms = 0; // timeout das telas pre-sessao (ver loop())
 
 int g_correction_index = 0; // usado em kChecksumFailed
+
+// --- backup opcional no cartao RFID ------------------------------------------
+enum StartRow { kStartRow24 = 0, kStartRow12, kStartRowRestore, kStartRowCount };
+int g_start_row = kStartRow24;
+bool g_restore_mode = false; // seed veio do cartao (pula a oferta de backup)
+PassphraseInput g_card_pw;
+PassphraseInput g_card_pw_confirm;
+uint8_t g_rfid_card[kMifareUsableBytes] = {0}; // blob a gravar / lido do cartao
+uint8_t g_rfid_scan[kMifareUsableBytes] = {0}; // conteudo anterior do cartao
+bool g_backup_ok = false;
+char g_backup_msg[32] = {0};
+uint32_t g_kdf_ms = 0; // exibido no sucesso, para calibrar kRfidPbkdf2Iterations
 
 // Menu principal em abas.
 enum Tab { kTabSign = 0, kTabWallet, kTabSession, kTabCount };
@@ -178,12 +199,21 @@ void wipe_seed_material() {
   memzero(g_mnemonic_text, sizeof(g_mnemonic_text));
   g_passphrase.wipe();
   wipe(&g_pending_mk);
+  g_card_pw.wipe();
+  g_card_pw_confirm.wipe();
+  memzero(g_rfid_card, sizeof(g_rfid_card));
+  memzero(g_rfid_scan, sizeof(g_rfid_scan));
+  rfid_wipe_scratch();
+  mnemonic_clear(); // buffer estatico de mnemonic_from_data() (bip39.c)
 }
 
 void go_to_start(const char *reason) {
   wipe_seed_material();
+  rfid_release_card();
   g_session.end();
   set_status(reason);
+  g_start_row = kStartRow24;
+  g_restore_mode = false;
   g_word_count_choice = kMnemonicWordsLong;
   g_network_choice = Network::kMainnet;
   g_state = State::kSelectWordCount;
@@ -220,10 +250,11 @@ int draw_address(int y, const char *grouped) {
 
 void render_select_word_count() {
   ui_begin_screen("SEED", "^v mover", "OK escolher");
-  ui_text(kMargin, 20, "NUMERO DE PALAVRAS DA SEED", color::kMuted);
-  ui_row(31, 24, "24 palavras", "padrao", g_word_count_choice == kMnemonicWordsLong);
-  ui_row(57, 24, "12 palavras", nullptr, g_word_count_choice == kMnemonicWordsShort);
-  if (g_status_line[0] != '\0') ui_text(kMargin, 100, g_status_line, color::kOrange);
+  ui_text(kMargin, 18, "COMO CARREGAR A SEED", color::kMuted);
+  ui_row(28, 22, "24 palavras", "padrao", g_start_row == kStartRow24);
+  ui_row(51, 22, "12 palavras", nullptr, g_start_row == kStartRow12);
+  ui_row(74, 22, "Restaurar do cartao", "RFID", g_start_row == kStartRowRestore);
+  if (g_status_line[0] != '\0') ui_text(kMargin, 104, g_status_line, color::kOrange);
 }
 
 void render_select_network() {
@@ -272,6 +303,7 @@ void render_passphrase_entry() {
   g_passphrase.render_display(display, sizeof(display));
   bool failed = g_status_line[0] != '\0';
   ui_input_box(kMargin, 36, kContentW, display, failed);
+  memzero(display, sizeof(display)); // com Tab, e a passphrase em claro
   if (failed) {
     ui_text(kMargin, 66, g_status_line, color::kError);
   } else {
@@ -301,6 +333,70 @@ void render_fingerprint_confirm() {
   }
   ui_text(kScreenW / 2, 100, "Confira com o anotado / Ian Coleman", color::kMuted,
           Font::kSmall, Align::kCenter);
+}
+
+// Tela de "aguarde" desenhada antes de uma operacao bloqueante (KDF, cartao).
+void render_busy(const char *title, const char *line1, const char *line2) {
+  ui_begin_screen(title, nullptr, "aguarde");
+  ui_text(kScreenW / 2, 48, line1, color::kText, Font::kBody, Align::kCenter);
+  if (line2 != nullptr) {
+    ui_text(kScreenW / 2, 72, line2, color::kMuted, Font::kSmall, Align::kCenter);
+  }
+}
+
+void render_backup_offer() {
+  ui_begin_screen("BACKUP RFID", "ESC pular", "OK gravar");
+  ui_text(kMargin, 20, "Gravar a seed cifrada num cartao?", color::kText);
+  ui_text(kMargin, 34, "MIFARE Classic via Unit RFID2.", color::kMuted);
+  ui_text(kMargin, 46, "A passphrase NAO vai para o cartao.", color::kMuted);
+  ui_text(kMargin, 62, "Quem copiar o cartao pode testar", color::kOrange);
+  ui_text(kMargin, 74, "senhas offline: use senha longa.", color::kOrange);
+  ui_text(kMargin, 90, "Nao substitui o backup em papel.", color::kMuted);
+}
+
+void render_card_password(const char *title, const char *label, const PassphraseInput &pw,
+                          const char *hint) {
+  ui_begin_screen(title, "ESC voltar  DEL apagar", "OK continuar");
+  ui_text(kMargin, 20, label, color::kMuted);
+  char display[kMaxPassphraseLen + 1];
+  pw.render_display(display, sizeof(display));
+  bool failed = g_status_line[0] != '\0';
+  ui_input_box(kMargin, 30, kContentW, display, failed);
+  memzero(display, sizeof(display));
+  ui_text(kMargin, 60, failed ? g_status_line : hint, failed ? color::kError : color::kMuted);
+  ui_text(kMargin, 72, "Tab mostra/oculta", color::kMuted);
+}
+
+void render_backup_overwrite_confirm() {
+  ui_begin_screen("CARTAO EM USO", "ESC cancelar", "OK sobrescrever");
+  ui_icon_error(kScreenW / 2, 34);
+  ui_text(kScreenW / 2, 52, "Este cartao ja tem dados", color::kText, Font::kBody, Align::kCenter);
+  ui_text(kScreenW / 2, 74, "Gravar por cima apaga tudo nele.", color::kMuted, Font::kSmall,
+          Align::kCenter);
+  ui_text(kScreenW / 2, 86, "Mantenha o mesmo cartao no leitor.", color::kMuted, Font::kSmall,
+          Align::kCenter);
+}
+
+void render_backup_result() {
+  if (g_backup_ok) {
+    ui_begin_screen("BACKUP RFID", nullptr, "OK continuar");
+    ui_icon_ok(kScreenW / 2, 36);
+    ui_text(kScreenW / 2, 56, "Backup gravado", color::kText, Font::kTitle, Align::kCenter);
+    ui_text(kScreenW / 2, 78, "gravado e conferido no cartao", color::kMuted, Font::kSmall,
+            Align::kCenter);
+    ui_text(kScreenW / 2, 90, "guarde a senha e o papel", color::kMuted, Font::kSmall,
+            Align::kCenter);
+    char kdf[32];
+    snprintf(kdf, sizeof(kdf), "KDF %lu iter: %lu ms",
+             static_cast<unsigned long>(kRfidPbkdf2Iterations),
+             static_cast<unsigned long>(g_kdf_ms));
+    ui_text(kScreenW / 2, 104, kdf, color::kTabIdle, Font::kSmall, Align::kCenter);
+  } else {
+    ui_begin_screen("BACKUP RFID", "ESC pular", "OK tentar de novo");
+    ui_icon_error(kScreenW / 2, 36);
+    ui_text(kScreenW / 2, 56, "Backup nao gravado", color::kText, Font::kTitle, Align::kCenter);
+    ui_text(kScreenW / 2, 78, g_backup_msg, color::kMuted, Font::kBody, Align::kCenter);
+  }
 }
 
 struct MenuRow {
@@ -521,6 +617,21 @@ void render() {
     case State::kChecksumFailed: render_checksum_failed(); break;
     case State::kPassphraseEntry: render_passphrase_entry(); break;
     case State::kFingerprintConfirm: render_fingerprint_confirm(); break;
+    case State::kBackupOffer: render_backup_offer(); break;
+    case State::kBackupPassword:
+      render_card_password("SENHA CARTAO", "SENHA DO CARTAO (min 12)", g_card_pw,
+                           "Ideal: 4 a 6 palavras aleatorias");
+      break;
+    case State::kBackupPasswordConfirm:
+      render_card_password("SENHA CARTAO", "REPITA A SENHA", g_card_pw_confirm,
+                           "Anote: sem ela o cartao e inutil");
+      break;
+    case State::kBackupOverwriteConfirm: render_backup_overwrite_confirm(); break;
+    case State::kBackupResult: render_backup_result(); break;
+    case State::kRestorePassword:
+      render_card_password("RESTAURAR", "SENHA DO CARTAO", g_card_pw,
+                           "A passphrase e pedida depois");
+      break;
     case State::kMainMenu: render_main_menu(); break;
     case State::kPsbtReviewOutput: render_psbt_review_output(); break;
     case State::kPsbtReviewFee: render_psbt_review_fee(); break;
@@ -572,6 +683,133 @@ void confirm_fingerprint_and_start_session() {
   wipe_seed_material();           // mnemonico e passphrase nao sao mais
                                   // necessarios: a MasterKey ja esta na sessao
   go_to_menu(kTabSign);
+}
+
+// --- backup/restauracao no cartao RFID ----------------------------------------
+
+const char *rfid_io_message(RfidIoStatus st) {
+  switch (st) {
+    case RfidIoStatus::kNoReader: return "Unit RFID2 nao encontrada";
+    case RfidIoStatus::kNoCard: return "Nenhum cartao encostado";
+    case RfidIoStatus::kUnsupportedCard: return "Nao e MIFARE Classic";
+    case RfidIoStatus::kAccessDenied: return "Cartao nao gravavel";
+    case RfidIoStatus::kVerifyFailed: return "Conferencia falhou";
+    case RfidIoStatus::kCardChanged: return "Outro cartao encostado";
+    default: return "Cartao afastado no meio";
+  }
+}
+
+bool same_secret(const PassphraseInput &a, const char *b) {
+  size_t len = static_cast<size_t>(a.length());
+  return len > 0 && strlen(b) == len && consteq(a.value(), b, len);
+}
+
+void finish_backup(bool ok, const char *msg) {
+  rfid_release_card();
+  memzero(g_rfid_card, sizeof(g_rfid_card));
+  memzero(g_rfid_scan, sizeof(g_rfid_scan));
+  g_backup_ok = ok;
+  copy_str(g_backup_msg, sizeof(g_backup_msg), msg);
+  g_state = State::kBackupResult;
+}
+
+void write_backup_to_card() {
+  render_busy("GRAVANDO", "Nao afaste o cartao", nullptr);
+  RfidIoStatus st = rfid_write_all(g_rfid_card);
+  if (st == RfidIoStatus::kOk) st = rfid_verify(g_rfid_card);
+  finish_backup(st == RfidIoStatus::kOk, st == RfidIoStatus::kOk ? "" : rfid_io_message(st));
+}
+
+// Cifra primeiro (a senha sai da RAM antes de tocar no cartao), depois grava.
+void start_backup() {
+  render_busy("CIFRANDO", "Derivando chave da senha", "leva alguns segundos");
+  uint32_t t0 = millis();
+  bool encoded = rfid_encode_backup(g_card_pw.value(), static_cast<size_t>(g_card_pw.length()),
+                                    g_mnemonic_text, kRfidPbkdf2Iterations, g_rfid_card);
+  g_kdf_ms = millis() - t0;
+  g_card_pw.wipe();
+  g_card_pw_confirm.wipe();
+  if (!encoded) {
+    finish_backup(false, "Falha ao cifrar");
+    return;
+  }
+  RfidIoStatus st = rfid_init();
+  if (st == RfidIoStatus::kOk) {
+    render_busy("CARTAO", "Encoste o cartao no leitor", "Unit RFID2 no Grove");
+    st = rfid_wait_for_card(kRfidCardWaitTimeoutMs);
+  }
+  if (st == RfidIoStatus::kOk) st = rfid_read_all(g_rfid_scan);
+  if (st != RfidIoStatus::kOk) {
+    finish_backup(false, rfid_io_message(st));
+    return;
+  }
+  bool blank = rfid_card_is_blank(g_rfid_scan);
+  memzero(g_rfid_scan, sizeof(g_rfid_scan));
+  if (!blank) {
+    // Antena desligada enquanto o usuario decide; a gravacao reseleciona o
+    // cartao e exige o mesmo UID.
+    rfid_release_card();
+    g_state = State::kBackupOverwriteConfirm;
+    return;
+  }
+  write_backup_to_card();
+}
+
+void start_restore() {
+  RfidIoStatus st = rfid_init();
+  if (st == RfidIoStatus::kOk) {
+    render_busy("CARTAO", "Encoste o cartao no leitor", "Unit RFID2 no Grove");
+    st = rfid_wait_for_card(kRfidCardWaitTimeoutMs);
+  }
+  if (st == RfidIoStatus::kOk) st = rfid_read_all(g_rfid_card);
+  rfid_release_card();
+  if (st != RfidIoStatus::kOk) {
+    go_to_start(rfid_io_message(st));
+    return;
+  }
+  if (rfid_card_is_blank(g_rfid_card)) {
+    go_to_start("Cartao sem backup");
+    return;
+  }
+  g_card_pw.wipe();
+  g_state = State::kRestorePassword;
+}
+
+void attempt_restore_decode() {
+  render_busy("DECIFRANDO", "Derivando chave da senha", "leva alguns segundos");
+  RfidCardStatus st = rfid_decode_backup(g_card_pw.value(), static_cast<size_t>(g_card_pw.length()),
+                                         g_rfid_card, kRfidPbkdf2Iterations, g_mnemonic_text,
+                                         sizeof(g_mnemonic_text));
+  g_card_pw.wipe();
+  switch (st) {
+    case RfidCardStatus::kOk:
+      memzero(g_rfid_card, sizeof(g_rfid_card));
+      g_passphrase.wipe();
+      g_state = State::kPassphraseEntry; // mesmo caminho da digitacao a partir daqui
+      break;
+    case RfidCardStatus::kAuthFailed:
+      // Indistinguiveis por design: senha errada, gravacao incompleta, cartao
+      // de outro formato/versao de kRfidPbkdf2Iterations.
+      set_status("Senha errada ou backup incompleto");
+      break;
+    default:
+      go_to_start("Cartao corrompido");
+      break;
+  }
+}
+
+// Tecla em uma tela de senha do cartao. Retorna true se foi Enter.
+bool edit_card_password(PassphraseInput *pw, const KeyEvent &key) {
+  if (key.tab) {
+    pw->toggle_visibility();
+  } else if (key.backspace) {
+    pw->backspace();
+  } else if (key.enter) {
+    return true;
+  } else if (key.ch != 0) {
+    pw->add_char(key.ch);
+  }
+  return false;
 }
 
 void start_psbt_review() {
@@ -728,11 +966,14 @@ void handle_key(const KeyEvent &key) {
   set_status("");
   switch (g_state) {
     case State::kSelectWordCount:
-      if ((key.ch == kKeyUp) || (key.ch == kKeyDown)) {
-        g_word_count_choice = (g_word_count_choice == kMnemonicWordsLong)
-                                  ? kMnemonicWordsShort
-                                  : kMnemonicWordsLong;
+      if (key.ch == kKeyUp) {
+        g_start_row = (g_start_row + kStartRowCount - 1) % kStartRowCount;
+      } else if (key.ch == kKeyDown) {
+        g_start_row = (g_start_row + 1) % kStartRowCount;
       } else if (key.enter) {
+        g_restore_mode = g_start_row == kStartRowRestore;
+        g_word_count_choice =
+            g_start_row == kStartRow12 ? kMnemonicWordsShort : kMnemonicWordsLong;
         g_state = State::kSelectNetwork;
       }
       break;
@@ -742,8 +983,13 @@ void handle_key(const KeyEvent &key) {
         g_network_choice = (g_network_choice == Network::kMainnet) ? Network::kTestnet
                                                                    : Network::kMainnet;
       } else if (key.enter) {
-        enter_mnemonic_entry();
+        if (g_restore_mode) {
+          start_restore();
+        } else {
+          enter_mnemonic_entry();
+        }
       } else if (key.esc) {
+        g_restore_mode = false;
         g_state = State::kSelectWordCount;
       }
       break;
@@ -800,11 +1046,89 @@ void handle_key(const KeyEvent &key) {
 
     case State::kFingerprintConfirm:
       if (key.enter) {
-        confirm_fingerprint_and_start_session();
+        // Unico ponto em que o mnemonico ainda esta na RAM antes do wipe.
+        if (g_restore_mode) {
+          confirm_fingerprint_and_start_session();
+        } else {
+          g_state = State::kBackupOffer;
+        }
       } else if (key.esc) {
         wipe(&g_pending_mk);
         g_passphrase.wipe();
         g_state = State::kPassphraseEntry;
+      }
+      break;
+
+    case State::kBackupOffer:
+      if (key.enter) {
+        g_card_pw.wipe();
+        g_card_pw_confirm.wipe();
+        g_state = State::kBackupPassword;
+      } else if (key.esc) {
+        confirm_fingerprint_and_start_session(); // comportamento sem backup
+      }
+      break;
+
+    case State::kBackupPassword:
+      if (key.esc) {
+        g_card_pw.wipe();
+        g_state = State::kBackupOffer;
+      } else if (edit_card_password(&g_card_pw, key)) {
+        RfidPasswordIssue issue =
+            rfid_check_password(g_card_pw.value(), static_cast<size_t>(g_card_pw.length()));
+        if (issue == RfidPasswordIssue::kTooShort) {
+          set_status("Curta demais: minimo 12 caracteres");
+        } else if (issue == RfidPasswordIssue::kOnlyDigits) {
+          set_status("So digitos cai rapido: use palavras");
+        } else if (issue == RfidPasswordIssue::kTooFewDistinct) {
+          set_status("Repetitiva demais: use palavras");
+        } else if (same_secret(g_card_pw, g_passphrase.value())) {
+          set_status("Nao use a mesma senha da passphrase");
+        } else {
+          g_card_pw_confirm.wipe();
+          g_state = State::kBackupPasswordConfirm;
+        }
+      }
+      break;
+
+    case State::kBackupPasswordConfirm:
+      if (key.esc) {
+        g_card_pw.wipe();
+        g_card_pw_confirm.wipe();
+        g_state = State::kBackupPassword;
+      } else if (edit_card_password(&g_card_pw_confirm, key)) {
+        if (same_secret(g_card_pw_confirm, g_card_pw.value())) {
+          start_backup();
+        } else {
+          g_card_pw.wipe();
+          g_card_pw_confirm.wipe();
+          g_state = State::kBackupPassword;
+          set_status("Senhas diferentes, digite de novo");
+        }
+      }
+      break;
+
+    case State::kBackupOverwriteConfirm:
+      if (key.enter) {
+        write_backup_to_card();
+      } else if (key.esc) {
+        finish_backup(false, "Gravacao cancelada");
+      }
+      break;
+
+    case State::kBackupResult:
+      if (key.enter && !g_backup_ok) {
+        g_state = State::kBackupPassword; // nova tentativa: senha digitada de novo
+      } else if (key.enter || key.esc) {
+        confirm_fingerprint_and_start_session();
+      }
+      break;
+
+    case State::kRestorePassword:
+      if (key.esc) {
+        go_to_start("Restauracao cancelada");
+      } else if (edit_card_password(&g_card_pw, key) && g_card_pw.length() > 0) {
+        attempt_restore_decode();
       }
       break;
 
@@ -921,7 +1245,13 @@ void loop() {
   bool pre_session = g_state == State::kMnemonicEntry ||
                      g_state == State::kChecksumFailed ||
                      g_state == State::kPassphraseEntry ||
-                     g_state == State::kFingerprintConfirm;
+                     g_state == State::kFingerprintConfirm ||
+                     g_state == State::kBackupOffer ||
+                     g_state == State::kBackupPassword ||
+                     g_state == State::kBackupPasswordConfirm ||
+                     g_state == State::kBackupOverwriteConfirm ||
+                     g_state == State::kBackupResult ||
+                     g_state == State::kRestorePassword;
   if ((pre_session && millis() - g_last_key_ms >= kSessionTimeoutMs) ||
       (g_session.is_active() && g_session.is_expired())) {
     go_to_start("Sessao encerrada por inatividade");

@@ -76,4 +76,33 @@ constexpr const char *kSignedSuffix = "_signed";
 constexpr const char *kXpubExportFile = "/wallet_export.txt";
 constexpr int kMaxPsbtFilesListed = 32; // quantos .psbt cabem no menu
 
+// --- Backup opcional cifrado da seed em cartao MIFARE Classic (Unit RFID2) ---
+// O cartao e legivel por qualquer um (chave de fabrica + Crypto1 quebrado):
+// a unica protecao e senha x custo do KDF. Valor provisorio, a ser fixado
+// por benchmark no aparelho (meta: ~5-8 s por backup/restauracao).
+constexpr uint32_t kRfidPbkdf2Iterations = 200000;
+// Com o cartao copiado, a senha e atacada offline em GPU: PINs curtos caem em
+// segundos. 12 caracteres e o piso; a tela recomenda 4-6 palavras aleatorias.
+constexpr int kMinRfidPasswordLen = 12;
+constexpr int kMinRfidPasswordDistinct = 8; // barra "aaaaaaaaaaaa", "121212121212"
+constexpr uint32_t kRfidCardWaitTimeoutMs = 8000;
+
+// Layout do blob (rfid_seed_card.h): salt | iv | ciphertext | tag | aleatorio.
+constexpr size_t kRfidSaltLen = 16;
+constexpr size_t kRfidIvLen = 16;
+constexpr size_t kRfidPlainLen = 48; // 3 blocos AES, tamanho fixo (sem padding)
+constexpr size_t kRfidTagLen = 32;
+constexpr size_t kRfidUsedLen = kRfidSaltLen + kRfidIvLen + kRfidPlainLen + kRfidTagLen; // 112
+
+// MIFARE Classic 1K: 16 setores x 4 blocos de 16 bytes. Bloco 0 (fabricante)
+// e o bloco 3 de cada setor (trailer) nunca sao escritos. Em cartoes 4K so os
+// 16 primeiros setores (identicos aos do 1K) sao usados.
+constexpr int kMifareBlockSize = 16;
+constexpr int kMifareSectors = 16;
+constexpr int kMifareUsableBlocks = 47;
+constexpr size_t kMifareUsableBytes = kMifareUsableBlocks * kMifareBlockSize; // 752
+constexpr uint8_t kMifareDefaultKeyA[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+static_assert(kRfidUsedLen <= kMifareUsableBytes, "blob nao cabe no cartao");
+
 } // namespace btcseed

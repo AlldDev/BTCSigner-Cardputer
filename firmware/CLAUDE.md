@@ -7,6 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 BTCSigner Cardputer: firmware for the M5Stack Cardputer (ESP32-S3) acting as a stateless, air-gapped
 Bitcoin PSBT signer. The seed is typed in by hand each session (never generated or persisted on
 device) and the only I/O channel is a microSD card — no WiFi/BLE, no camera/QR, no secure element.
+Exception, opt-in only: an encrypted backup of the seed's BIP39 entropy (never the passphrase) on a
+MIFARE Classic card via the M5Stack Unit RFID2 (WS1850S, I2C 0x28 on Grove G2/G1). See
+`firmware/README.md` "Backup opcional no cartão RFID".
 Scope is deliberately narrow: BIP84 native SegWit (P2WPKH) only, single-sig, SIGHASH_ALL only, PSBT v0.
 
 `firmware/README.md` (in Portuguese, next to this file) holds the detailed technical docs — read it
@@ -33,8 +36,8 @@ Three environments in `platformio.ini`:
 - `cardputer` — real hardware, `board = m5stack-stamps3` (ESP32-S3), release build, Serial/USB-CDC
   disabled.
 - `cardputer-debug` — same, but `-DCORE_DEBUG_LEVEL=3` and Serial on, for development.
-- `native` — host-only, excludes `main.cpp`/`ui.cpp`/`sd_io.cpp` (the hardware-dependent files),
-  used exclusively to run tests.
+- `native` — host-only, excludes `main.cpp`/`ui.cpp`/`sd_io.cpp`/`rfid_io.cpp` (the
+  hardware-dependent files) and `lib_ignore`s `MFRC522_I2C`, used exclusively to run tests.
 
 To flash via M5Launcher (which only accepts a merged image, not the bare `firmware.bin`):
 
@@ -63,8 +66,11 @@ pio test -e native -f test_review_screens        # one suite, by test/ directory
 
 Suites live under `firmware/test/`, one Unity binary per directory: `test_bip32_vectors`,
 `test_bip39_vectors`, `test_bip84_vectors`, `test_mnemonic_input`, `test_passphrase_input`,
-`test_psbt_parse`, `test_review_screens`, `test_sd_io_paths`, `test_session`. `main.cpp` and
-`ui.cpp` have no host tests — they're hardware-only and excluded from `native`.
+`test_psbt_parse`, `test_review_screens`, `test_rfid_seed_card`, `test_rfid_integration`,
+`test_sd_io_paths`, `test_session`. `main.cpp`, `ui.cpp`, `sd_io.cpp` and `rfid_io.cpp` have no host
+tests — they're hardware-only and excluded from `native`. The golden vectors in
+`test_rfid_seed_card` come from an independent Python implementation (hashlib + cryptography); if the
+card format changes, regenerate them the same way rather than copying the firmware's own output.
 
 No lint/format config and no CI is configured for this project (the `.clang-format`/`.github` files
 found under `firmware/lib/trezor-firmware/` belong to the vendored upstream submodule, not this repo).
@@ -94,8 +100,22 @@ found under `firmware/lib/trezor-firmware/` belong to the vendored upstream subm
   host-testable. `sd_io.cpp` — the actual SD card I/O via Arduino `SD.h`/`SPI.h`, hardware-only,
   hardcoded pins (SCK=40, MISO=39, MOSI=14, CS=12, 25MHz) matching M5Stack's official example.
 - `trezor_platform.cpp` — the two hooks trezor-crypto needs from the platform: a fault handler and
-  `random_buffer()` (hardware RNG on device, `getrandom()` on host). Used only for ECDSA blinding,
-  never as the seed source.
+  `random_buffer()` (`esp_random()` on device, `getrandom()` on host), used only for ECDSA blinding,
+  never as the seed source. Also `strong_random_buffer()` (`strong_random.h`): with WiFi/BT off,
+  `esp_random()` is only pseudo-random, so this wraps it in `bootloader_random_enable/disable` (SAR
+  ADC noise). Anything needing real entropy (RFID salt/IV) must use it.
+- `rfid_seed_card.h/cpp` — pure, host-tested format and crypto of the RFID backup. It composes
+  trezor-crypto primitives (PBKDF2-SHA256 single block → HMAC-derived AES/MAC keys, AES-256-CBC,
+  encrypt-then-MAC checked with `consteq` before decrypting), plus the MIFARE data-block mapping
+  that skips block 0 and the sector trailers. All secrets live in one static scratch struct that is
+  zeroed on every return. `rfid_io.h/cpp` — hardware-only Unit RFID2 I/O via the vendored
+  `lib/MFRC522_I2C` on Arduino `Wire` (I2C_NUM_0; `Wire1` would collide with Cardputer-ADV's
+  internal bus). It probes 0x28, checks `VersionReg` and does a time-bounded soft reset before
+  `PCD_Init()` (the lib's `PCD_Reset` hangs forever without the chip), turns the antenna on only
+  while operating the card, and only ever sees ciphertext. After `PCD_StopCrypto1()` a MIFARE
+  Classic card stays authenticated and ignores a plain auth, so every operation starts with an RF
+  field cycle + WUPA + select that must return the same UID, and later sectors use nested auth.
+  That behavior can only be verified on real hardware, because host tests simulate the card.
 - `ui.h/cpp` — hardware-only drawing and keyboard-reading primitives (M5Cardputer/M5GFX), no screen
   flow/state logic. The Cardputer keyboard has **no Esc or arrow keys**: ESC is mapped to the
   backtick key, navigation to `;` `,` `.` `/` — this is a real hardware constraint, not a design
@@ -119,9 +139,17 @@ libsecp256k1 (Bitcoin Core's library) is **not** used; trezor-crypto's own `secp
 - No WiFi/BLE: the ESP32-S3 has the radio hardware, but it's never initialized, and this is verified
   against the *linked binary* (`nm` shows no `esp_wifi_init`/`esp_bt_controller_init`/bluedroid/nimble
   symbols), not just source grep. Don't introduce `WiFi.h`, `BLEDevice.h`, `esp_wifi.h`, or `esp_bt.h`.
-- `arduino-esp32` always links `libwpa_supplicant.a`, which defines its own `hmac_sha256` colliding
-  with trezor-crypto's. Fixed via a compiler-level rename (`-Dhmac_sha256=btcseed_tc_hmac_sha256` in
+- `arduino-esp32` always links `libwpa_supplicant.a`, which defines its own `hmac_sha256`,
+  `aes_encrypt` and `aes_decrypt`, colliding with trezor-crypto's. Fixed via compiler-level renames
+  (`-Dhmac_sha256=btcseed_tc_hmac_sha256`, `-Daes_encrypt=...`, `-Daes_decrypt=...` in
   `platformio.ini`), not by patching the vendored submodule — don't "fix" this the other way.
+- The RFID card is public (Crypto1 broken, factory Key A): nothing in clear may be written to it,
+  its size must not depend on the seed, the passphrase must never go on it, and every secret buffer
+  (password inputs, card buffers, `rfid_wipe_scratch()`, `mnemonic_clear()`) is covered by
+  `wipe_seed_material()`. The backup offer only exists between fingerprint confirmation and
+  `confirm_fingerprint_and_start_session()`, the last moment the mnemonic is still in RAM.
+- Never call the `PICC_Dump*`/`PCD_DumpVersionToSerial` functions of `MFRC522_I2C`, and don't add
+  `Serial`/`ESP_LOG` output to `rfid_*` files.
 - PSBT validation is fail-closed by design: anything the parser can't fully verify (unrecognized
   script, unverifiable change claim, mismatched derivation) must be rejected or flagged, not
   silently accepted.

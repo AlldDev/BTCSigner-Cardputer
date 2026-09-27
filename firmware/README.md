@@ -8,6 +8,7 @@ Documentação técnica do firmware. Para a visão geral do projeto, ver o
   <a href="#módulos">Módulos</a> ·
   <a href="#parser-de-psbt">Parser de PSBT</a> ·
   <a href="#microsd">microSD</a> ·
+  <a href="#backup-opcional-no-cartão-rfid">Backup RFID</a> ·
   <a href="#telas-e-teclado">Telas e teclado</a> ·
   <a href="#build">Build</a> ·
   <a href="#testes">Testes</a> ·
@@ -27,6 +28,10 @@ o teclado e a E/S no microSD rodam no aparelho físico: entrada de seed, aba CAR
 ser usado com fundos reais** antes do primeiro uso em mainnet com valores pequenos (ver
 [O que falta](#o-que-falta)).
 
+O [backup opcional no cartão RFID](#backup-opcional-no-cartão-rfid) tem formato e criptografia
+testados no host (inclusive contra uma implementação de referência independente), mas **ainda não
+foi validado no aparelho** com a Unit RFID2.
+
 ---
 
 ## Módulos
@@ -45,6 +50,9 @@ ser usado com fundos reais** antes do primeiro uso em mainnet com valores pequen
 | Formatação da tela de revisão | `src/review_screens.{h,cpp}` | feito, testado |
 | E/S no microSD (nomes/caminhos) | `src/sd_io_paths.cpp` (via `sd_io.h`) | feito, testado |
 | E/S no microSD (hardware) | `src/sd_io.cpp` | feito, validado no aparelho |
+| Backup RFID: formato e criptografia | `src/rfid_seed_card.{h,cpp}` | feito, testado |
+| Backup RFID: Unit RFID2 (hardware) | `src/rfid_io.{h,cpp}` | feito, pendente validação no aparelho |
+| Entropia real (salt/IV) | `src/strong_random.h` (em `trezor_platform.cpp`) | feito |
 | Primitivas de tela/teclado | `src/ui.{h,cpp}` | feito, validado no aparelho |
 | Máquina de estados / loop principal | `src/main.cpp` | feito, validado no aparelho (testnet) |
 | Hooks de plataforma do trezor-crypto | `src/trezor_platform.cpp` | feito |
@@ -107,6 +115,75 @@ tem a E/S de fato (Arduino `SD.h`/`SPI.h`) e só compila no ambiente `cardputer`
   do menu.
 - **Layout no cartão**: PSBTs em `/psbt/*.psbt` (até 32 listadas), assinadas gravadas como
   `<nome>_signed.psbt`, export em `/wallet_export.txt`.
+
+---
+
+## Backup opcional no cartão RFID
+
+Recurso **opt-in**: por padrão nada muda, e a seed continua sendo digitada a cada sessão. Depois de
+confirmar o fingerprint de uma seed **digitada**, o firmware oferece gravar uma cópia cifrada num
+cartão MIFARE Classic 1K/4K pela **M5Stack Unit RFID2** (chip WS1850S, compatível com o MFRC522).
+Na tela inicial, "Restaurar do cartão" lê essa cópia em vez de pedir as palavras. A **passphrase
+nunca vai para o cartão**: ela continua sendo digitada depois da restauração, então segue valendo
+como segundo fator.
+
+**Hardware.** Unit RFID2 no Grove do Cardputer: I2C `0x28`, SDA=G2, SCL=G1, `Wire` do Arduino
+(`I2C_NUM_0`). No M5Unified 0.2.23 essa porta só seria usada pelo `Ex_I2C` com
+`external_rtc`/`external_imu` ligados (não estão), e o I2C interno do Cardputer-ADV (teclado
+TCA8418) fica em `I2C_NUM_1`. O `rfid_init()` sonda o endereço, confere o `VersionReg` e faz um
+soft reset com limite de tempo antes do `PCD_Init()`, porque o `PCD_Reset()` da lib trava em loop
+infinito se o chip não responder. O leitor é reinicializado a cada uso. A antena só é ligada
+enquanto se espera ou opera o cartão; ela fica desligada inclusive na tela "Cartão em uso".
+
+**Reseleção a cada operação.** No MIFARE Classic, depois de `PCD_StopCrypto1()` o cartão continua
+autenticado e ignora uma nova autenticação em claro. Por isso cada leitura, gravação ou conferência
+começa com um ciclo do campo de RF (o cartão volta a IDLE) seguido de WUPA e seleção, e exige o mesmo
+UID detectado no início, o que acusa um cartão trocado. Os setores seguintes usam autenticação
+aninhada, sem `StopCrypto1` entre eles, como faz o próprio `PICC_DumpMifareClassicToSerial()` do
+upstream. Como os testes no host simulam o cartão, esse ponto **só é validado no aparelho**.
+
+**O cartão é tratado como público.** A proteção nativa do MIFARE Classic (Crypto1) está quebrada, e
+o firmware usa a Key A de fábrica só para ter acesso de leitura e escrita. Quem pegar o cartão copia
+tudo em segundos. Por isso toda a segurança vem da cifra (`src/rfid_seed_card.h`):
+
+```
+[0,16)    salt       [16,32) iv       [32,80) AES-256-CBC de 48 bytes fixos
+[80,112)  HMAC-SHA256(mac_key, [0,80))       [112,752) bytes aleatórios
+texto plano: versão | nº de palavras (12|24) | entropia BIP39 (slot de 32) | aleatório
+master = PBKDF2-HMAC-SHA256(senha, salt, kRfidPbkdf2Iterations), 1 bloco de 32 bytes
+aes_key/mac_key = HMAC-SHA256(master, "BTCSigner-RFID-v1-enc" / "...-mac")
+```
+
+- **Indistinguível de dados aleatórios.** Não há magic, versão nem contagem de iterações em
+  claro, e o blob tem o mesmo tamanho para 12 ou 24 palavras. Os 47 blocos de dados são sempre
+  regravados, então não sobra nada de um backup anterior.
+- **Entropia real para salt, IV e preenchimento.** Sem WiFi/BT, o `esp_random()` é só
+  pseudoaleatório; o `strong_random_buffer()` liga a fonte de ruído do SAR ADC
+  (`bootloader_random_enable`) durante a geração.
+- **PBKDF2 de um único bloco.** Com 64 bytes de saída, o aparelho pagaria o KDF duas vezes e o
+  atacante uma só. O PBKDF2 é chamado via `Init/Update/Final`, porque o wrapper deixa o digest na
+  stack.
+- **MAC conferido antes de decifrar**, com `consteq()`. Um texto plano de tamanho fixo não tem
+  padding, o que elimina padding oracle.
+- **Wipe.** Chaves, contextos AES (a lib não os zera), texto plano e bits BIP39 ficam num único
+  buffer estático, zerado em todo retorno. Em seguida um `scrub_stack()` sobrescreve 1,5 KB de
+  stack, onde `aes_*_key256`, `aescrypt` e `sha256_Transform` do código vendorizado deixam round
+  keys e estado sem zerar. O `mnemonic_clear()` é chamado logo após
+  `mnemonic_from_data()`, que escreve num buffer estático da lib. As senhas ficam em
+  `PassphraseInput`. Tudo entra em `wipe_seed_material()`.
+- **Senha.** Mínimo de 12 caracteres, pelo menos 8 caracteres distintos, não pode ser só dígitos
+  (`rfid_check_password`), diferente da passphrase, digitada duas vezes. Essas regras só barram o que
+  cai rápido; não medem força de verdade. A cifra
+  acontece antes de tocar no cartão, e a senha é zerada logo depois. Depois de gravar, o cartão é
+  relido e comparado. Um cartão com dados pede confirmação antes de ser sobrescrito.
+- **`kRfidPbkdf2Iterations` (`config.h`)** é provisório (200k). A tela de sucesso mostra quanto o
+  KDF levou; calibrar no aparelho para cerca de 5 a 8 s. O valor não fica gravado no cartão, então
+  mudá-lo invalida os backups existentes (o que exige regravar). Isso é consequência de não ter
+  cabeçalho em claro: senha errada, gravação incompleta e backup de outra versão aparecem todos como
+  "Senha errada ou backup incompleto".
+- **Bateria depois do backup.** O `bootloader_random_disable()` reinicia o SAR ADC, e a leitura de
+  bateria do cabeçalho pode ficar errada até o aparelho reiniciar. É só cosmético, mas precisa ser
+  conferido no aparelho.
 
 ---
 
@@ -211,8 +288,9 @@ pio test -e native -f test_review_screens    # uma suíte, pelo nome do diretór
 
 Cada diretório em `test/` é um binário Unity independente rodando no host: `test_bip32_vectors`,
 `test_bip39_vectors`, `test_bip84_vectors`, `test_mnemonic_input`, `test_passphrase_input`,
-`test_psbt_parse`, `test_review_screens`, `test_sd_io_paths`, `test_session`. `ui.cpp`, `main.cpp`
-e `sd_io.cpp` dependem de hardware e ficam de fora do `native`.
+`test_psbt_parse`, `test_review_screens`, `test_rfid_seed_card`, `test_rfid_integration`,
+`test_sd_io_paths`, `test_session`. `ui.cpp`, `main.cpp`, `sd_io.cpp` e `rfid_io.cpp` dependem de
+hardware e ficam de fora do `native`.
 
 Vetores e casos cobertos:
 
@@ -229,6 +307,16 @@ Vetores e casos cobertos:
   array de scriptCode com um elemento a menos, que deslocava `OP_EQUALVERIFY`/`OP_CHECKSIG`). Casos
   maliciosos/malformados: fingerprint errado, sighash ≠ ALL, troco falsificado, arquivo truncado,
   magic corrompido, scriptSig não-vazio na unsigned tx, round-trip binário/base64, entre outros.
+- **Backup RFID**: vetor fixo gerado por uma implementação independente (Python: `hashlib` +
+  `cryptography`) com RNG de contador, tanto para codificar quanto para decodificar; round-trip de
+  12 e 24 palavras (inclusive com as iterações de produção); senha errada, prefixo da senha,
+  iterações diferentes e 1 byte alterado em salt/iv/ciphertext/tag viram `kAuthFailed`, com a saída
+  zerada; cartão de fábrica (0x00/0xFF) é detectado; MAC válido com conteúdo inválido vira
+  `kMalformed`; dois backups da mesma seed não compartilham nenhum trecho; nenhum fragmento da
+  entropia ou das palavras aparece no cartão; mapeamento de blocos nunca toca trailer nem bloco 0.
+  `test_rfid_integration` percorre o fluxo inteiro (digitar → derivar → backup → cartão simulado →
+  restaurar → mesma MasterKey e zpub), confere que o cartão restaurado sem a passphrase gera outra
+  carteira e confere que nenhum segredo sobra nos buffers.
 
 ---
 
@@ -242,12 +330,18 @@ seção de memória que o linker script do chip sempre declara). O único símbo
 `esp_bt_controller_mem_release`, que o boilerplate do arduino-esp32 chama para LIBERAR a RAM
 reservada ao controlador — o oposto de inicializá-lo.
 
-**`hmac_sha256` colide com a stack WiFi.** O arduino-esp32 sempre linka `libwpa_supplicant.a`
-(mesmo sem chamar nenhuma API de rádio), que define sua própria `hmac_sha256`, colidindo com a de
-`hmac.c` do trezor-crypto ("multiple definition"). Resolvido com uma flag em `platformio.ini`
-(`-Dhmac_sha256=btcseed_tc_hmac_sha256`, um `#define` de renomeação, não um patch no vendorizado).
-Essa função específica (o wrapper one-shot, não Init/Update/Final) não é chamada por nada que este
-firmware usa.
+**Exceção opt-in: a Unit RFID2.** O leitor RFID é um módulo externo que emite um campo de 13,56 MHz
+de curto alcance (menos de 2 cm para ler). A antena só fica ligada enquanto o usuário espera ou opera
+o cartão num backup/restauração, e por ela passa só o blob já cifrado. Com o módulo desconectado, o
+aparelho continua sem nenhum rádio.
+
+**Colisões com a stack WiFi.** O arduino-esp32 sempre linka `libwpa_supplicant.a` (mesmo sem chamar
+nenhuma API de rádio), que define suas próprias `hmac_sha256`, `aes_encrypt` e `aes_decrypt`,
+colidindo com as do trezor-crypto ("multiple definition"). Isso é resolvido com flags em
+`platformio.ini` (`-Dhmac_sha256=btcseed_tc_hmac_sha256`, `-Daes_encrypt=...`, `-Daes_decrypt=...`),
+que são `#define`s de renomeação e não patches no código vendorizado. Como as flags valem para o
+build inteiro, `rfid_seed_card.cpp` também chama os nomes renomeados, ou seja, sempre a versão do
+trezor-crypto. Confira com `nm firmware.elf`: só aparecem `btcseed_tc_*`.
 
 ---
 
@@ -265,11 +359,17 @@ sem modificar o upstream) — ver [`lib/trezor_crypto/README.md`](./lib/trezor_c
 a lista e a justificativa de cada um, incluindo os dois casos de código próprio: stubs para símbolos
 inalcançáveis (`ed25519_stub.c`) e os hooks de plataforma em `src/trezor_platform.cpp`
 (`tc_fault_handler` e `random_buffer` — RNG de hardware no aparelho, `getrandom()` no host, usado
-só para blinding de ECDSA, nunca como fonte da seed).
+só para blinding de ECDSA, nunca como fonte da seed; e `strong_random_buffer`, com a fonte de ruído
+do ADC ligada, para salt/IV do backup RFID).
 
-**Auditoria**: este projeto não implementa curva elíptica, hash, HMAC, PBKDF2 nem derivação
-BIP32/39. As únicas linhas "sensíveis" próprias são os wrappers finos em `src/keys.cpp` (orquestra
-chamadas ao trezor-crypto) e os dois hooks de plataforma.
+O driver da Unit RFID2 (`lib/MFRC522_I2C/`) também é vendorizado, sem modificação e num commit
+fixo, com hashes e a revisão feita em [`lib/MFRC522_I2C/README.md`](./lib/MFRC522_I2C/README.md).
+
+**Auditoria**: este projeto não implementa curva elíptica, hash, HMAC, AES, PBKDF2 nem derivação
+BIP32/39. As linhas "sensíveis" próprias são os wrappers finos em `src/keys.cpp`, os hooks de
+plataforma e a **composição** das primitivas do trezor-crypto no formato do backup RFID
+(`src/rfid_seed_card.cpp`: KDF, encrypt-then-MAC e wipe). Essa composição é o trecho que mais
+merece revisão de terceiros.
 
 ### Revisão da uBitcoin
 
@@ -313,10 +413,46 @@ Este firmware **nunca gera a seed**:
 5. Digite as palavras no Cardputer a cada sessão e confira que o fingerprint exibido bate com o
    anotado.
 
+### Backup opcional no cartão RFID
+
+Ativar o backup **reintroduz uma cópia persistida da seed** (cifrada) que não existia antes. É
+uma troca deliberada de segurança por praticidade, e vale a pena entender o que se ganha e o que se
+perde:
+
+- **O cartão é público.** Crypto1 está quebrado e o acesso usa a chave de fábrica; um leitor
+  qualquer (inclusive um celular) copia o cartão. A comunicação por RF também pode ser capturada à
+  distância durante o uso. Em todos os casos o atacante obtém só o blob cifrado.
+- **A segurança depende só da senha e do KDF.** Com o blob em mãos, o atacante testa senhas offline,
+  sem limite, numa GPU; não existe esquema que evite isso, porque qualquer verificação que o
+  aparelho faz, o atacante também faz (inclusive conferindo endereços na blockchain). Ordens de
+  grandeza para PBKDF2-SHA256 com 200k iterações numa GPU de ponta (cerca de 4·10⁴ tentativas/s):
+
+  | Senha do cartão | Tempo para esgotar (1 GPU) |
+  |---|---|
+  | PIN de 6 dígitos | segundos |
+  | 8 caracteres `[a-z0-9]` aleatórios | cerca de 2 anos (1 semana com 100 GPUs) |
+  | 4 palavras diceware aleatórias | milhares de anos |
+  | 6 palavras diceware aleatórias | inviável |
+
+  Por isso o firmware exige no mínimo 12 caracteres. O recomendado são 4 a 6 palavras aleatórias.
+- **A passphrase não vai para o cartão.** Quebrar a senha do cartão entrega o mnemônico, mas não a
+  carteira protegida pela passphrase. Quem não usa passphrase fica só com a senha do cartão.
+- **Não há bloqueio por tentativas.** Não teria efeito, já que o ataque real é offline sobre a cópia.
+- **O cartão não substitui o backup em papel.** Cartões falham, e mudar
+  `kRfidPbkdf2Iterations` ou o formato invalida os backups gravados.
+- **Resíduo de stack.** Funções internas do SHA-256 do trezor-crypto podem deixar resíduo na stack
+  durante o KDF, a mesma limitação que o caminho BIP39 já aceita (sem secure element, veja acima).
+
 ---
 
 ## O que falta
 
 - **Primeiro uso em mainnet** com valores pequenos.
+- **Backup RFID no aparelho**: validar a Unit RFID2 no Grove (alimentação de 5 V na bateria,
+  convivência do `Wire` com o M5Unified, e o Cardputer-ADV se for o caso), a leitura e gravação dos
+  16 setores com a reseleção + autenticação aninhada, a leitura de bateria depois de um backup, e
+  calibrar
+  `kRfidPbkdf2Iterations` pelo tempo exibido na tela de sucesso, e confirmar com um leitor externo
+  que o dump do cartão não tem nada legível.
 - Tela opcional de revisão do mnemônico em grupos pequenos — não implementada, explicitamente
   opcional.

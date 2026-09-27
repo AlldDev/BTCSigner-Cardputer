@@ -51,6 +51,7 @@ nao de auditoria de codigo:
 | `rfc6979.c` | nonce deterministico (RFC6979) para ECDSA — caminho realmente usado na assinatura |
 | `hmac_drbg.c` | dependencia de `rfc6979.c` |
 | `hasher.c` | dispatcher de hash generico usado por `hdnode_fingerprint`/`hdnode_serialize*` |
+| `aescrypt.c`, `aeskey.c`, `aestab.c`, `aes_modes.c` | AES-256-CBC (`aes/`) do backup opcional cifrado no cartao RFID (`src/rfid_seed_card.cpp`). Tabelas estaticas (`STATIC_TABLES` em `aesopt.h`), entao `aes_init()` nao precisa ser chamado; `USE_VIA_ACE_IF_PRESENT` nunca e definido |
 | `blake256.c`, `blake2b.c`, `groestl.c`, `sha3.c` | outras familias de hash que o `switch` de `hasher.c` referencia para OUTRAS moedas — nunca exercitadas com `secp256k1_info` (que so usa SHA-256/RIPEMD-160), mas precisam linkar porque fazem parte do mesmo `switch` |
 
 Todos os arquivos acima sao auto-contidos (sem dependencia de bibliotecas
