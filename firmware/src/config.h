@@ -75,6 +75,8 @@ constexpr const char *kPsbtExtension = ".psbt";
 constexpr const char *kSignedSuffix = "_signed";
 constexpr const char *kXpubExportFile = "/wallet_export.txt";
 constexpr int kMaxPsbtFilesListed = 32; // quantos .psbt cabem no menu
+// Sem cartao montado, a aba ASSINAR tenta montar de novo a cada kSdPollMs.
+constexpr uint32_t kSdPollMs = 2000;
 
 // --- Backup opcional cifrado da seed em cartao MIFARE Classic (Unit RFID2) ---
 // O cartao e legivel por qualquer um (chave de fabrica + Crypto1 quebrado):
@@ -86,6 +88,8 @@ constexpr uint32_t kRfidPbkdf2Iterations = 200000;
 constexpr int kMinRfidPasswordLen = 12;
 constexpr int kMinRfidPasswordDistinct = 8; // barra "aaaaaaaaaaaa", "121212121212"
 constexpr uint32_t kRfidCardWaitTimeoutMs = 8000;
+// Tela cheia de erro da restauracao antes de voltar sozinha ao inicio.
+constexpr uint32_t kCardErrorShowMs = 3000;
 
 // Layout do blob (rfid_seed_card.h): salt | iv | ciphertext | tag | aleatorio.
 constexpr size_t kRfidSaltLen = 16;

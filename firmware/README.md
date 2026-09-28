@@ -115,6 +115,12 @@ tem a E/S de fato (Arduino `SD.h`/`SPI.h`) e só compila no ambiente `cardputer`
   do menu.
 - **Layout no cartão**: PSBTs em `/psbt/*.psbt` (até 32 listadas), assinadas gravadas como
   `<nome>_signed.psbt`, export em `/wallet_export.txt`.
+- **Troca a quente**: dá para inserir, tirar ou trocar o microSD com o aparelho ligado. Ao entrar na
+  aba ASSINAR (e antes de exportar o xpub), o firmware desmonta e monta o cartão de novo
+  (`sd_remount()`), para nunca escrever num cartão trocado com a FAT em cache do anterior. A
+  tecla **R** na aba ASSINAR faz o mesmo na hora. Sem cartão montado, a aba tenta montar a cada
+  2 s (`kSdPollMs`), então um cartão inserido aparece sozinho. Uma remoção só é percebida no
+  próximo R, na próxima entrada na aba ou quando uma leitura/gravação falha.
 
 ---
 
@@ -176,6 +182,10 @@ aes_key/mac_key = HMAC-SHA256(master, "BTCSigner-RFID-v1-enc" / "...-mac")
   cai rápido; não medem força de verdade. A cifra
   acontece antes de tocar no cartão, e a senha é zerada logo depois. Depois de gravar, o cartão é
   relido e comparado. Um cartão com dados pede confirmação antes de ser sobrescrito.
+- **Erros da restauração em tela cheia.** Leitor ausente, cartão sem backup ou corrompido aparecem
+  numa tela de erro por 3 s (`kCardErrorShowMs`), que volta sozinha ao início (Enter/Esc voltam
+  antes). Tudo é zerado antes da tela aparecer. Senha errada continua na tela de senha, para tentar
+  de novo.
 - **`kRfidPbkdf2Iterations` (`config.h`)** é provisório (200k). A tela de sucesso mostra quanto o
   KDF levou; calibrar no aparelho para cerca de 5 a 8 s. O valor não fica gravado no cartão, então
   mudá-lo invalida os backups existentes (o que exige regravar). Isso é consequência de não ter

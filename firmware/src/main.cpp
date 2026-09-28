@@ -50,6 +50,7 @@ enum class State {
   kBackupOverwriteConfirm, // cartao ja tem dados
   kBackupResult,
   kRestorePassword, // senha do cartao lido em "Restaurar do cartao"
+  kCardError,       // erro na restauracao: tela cheia, volta sozinha ao inicio
   kMainMenu, // abas ASSINAR / CARTEIRA / SESSAO
   kPsbtReviewOutput,
   kPsbtReviewFee,
@@ -77,6 +78,7 @@ Session g_session(millis_fn);
 
 State g_state = State::kSelectWordCount;
 bool g_sd_ok = false;
+uint32_t g_sd_last_poll_ms = 0; // deteccao de cartao inserido na aba ASSINAR
 
 int g_word_count_choice = kMnemonicWordsLong;
 Network g_network_choice = Network::kMainnet;
@@ -138,6 +140,7 @@ bool g_xpub_saved = false;
 bool g_xpub_write_attempted = false; // true so quando veio de "Baixar arquivo"
 char g_error_title[32] = {0};
 char g_error_msg[48] = {0};
+uint32_t g_card_error_since = 0; // kCardError
 
 char g_index_entry[8] = {0}; // "Endereco de recebimento": indice digitado
 int g_index_entry_len = 0;
@@ -219,9 +222,22 @@ void go_to_start(const char *reason) {
   g_state = State::kSelectWordCount;
 }
 
+// Erro na restauracao pelo cartao: limpa tudo ja (nada fica na RAM enquanto a
+// tela aparece) e mostra em tela cheia; loop() volta ao inicio sozinho.
+void show_card_error(const char *title, const char *msg) {
+  go_to_start("");
+  copy_str(g_error_title, sizeof(g_error_title), title);
+  copy_str(g_error_msg, sizeof(g_error_msg), msg);
+  g_card_error_since = millis();
+  g_state = State::kCardError;
+}
+
+// Remonta sempre: o cartao pode ter sido inserido, removido ou trocado.
 void refresh_psbt_list() {
-  g_psbt_file_count = list_psbt_files(g_psbt_files, kMaxPsbtFilesListed);
+  g_sd_ok = sd_remount();
+  g_psbt_file_count = g_sd_ok ? list_psbt_files(g_psbt_files, kMaxPsbtFilesListed) : 0;
   g_psbt_file_selected = 0;
+  g_sd_last_poll_ms = millis();
 }
 
 void go_to_menu(int tab) {
@@ -415,8 +431,8 @@ void render_menu_rows(int y0, const MenuRow *rows, int n) {
 }
 
 void render_main_menu() {
-  ui_begin_screen("SIGNER", g_status_line[0] != '\0' ? g_status_line : "<> abas  ^v mover",
-                  "OK abrir");
+  const char *hint = g_tab == kTabSign ? "<> abas ^v R atualiza" : "<> abas  ^v mover";
+  ui_begin_screen("SIGNER", g_status_line[0] != '\0' ? g_status_line : hint, "OK abrir");
   ui_tabs(kBodyTop, kTabLabels, kTabCount, g_tab);
   int y0 = kBodyTop + kTabsH + 1;
 
@@ -426,6 +442,8 @@ void render_main_menu() {
               Align::kCenter);
       ui_text(kScreenW / 2, 74, g_sd_ok ? "coloque em /psbt ou na raiz" : "cartao SD nao montado",
               g_sd_ok ? color::kMuted : color::kError, Font::kSmall, Align::kCenter);
+      ui_text(kScreenW / 2, 86, g_sd_ok ? "R atualiza a lista" : "insira o cartao: detecta sozinho",
+              color::kMuted, Font::kSmall, Align::kCenter);
       return;
     }
     MenuRow rows[kMaxPsbtFilesListed];
@@ -536,6 +554,13 @@ void render_psbt_done() {
   ui_text(kScreenW / 2, 82, g_signed_name, color::kMuted, Font::kSmall, Align::kCenter);
 }
 
+void render_card_error() {
+  ui_begin_screen("ERRO", nullptr, "voltando...");
+  ui_icon_error(kScreenW / 2, 38);
+  ui_text(kScreenW / 2, 58, g_error_title, color::kText, Font::kTitle, Align::kCenter);
+  ui_text(kScreenW / 2, 80, g_error_msg, color::kMuted, Font::kBody, Align::kCenter);
+}
+
 void render_error() {
   ui_begin_screen("ERRO", "ESC voltar", "OK voltar");
   ui_icon_error(kScreenW / 2, 38);
@@ -602,7 +627,8 @@ void render_receive_address_show() {
 }
 
 HeaderNet header_net() {
-  if (g_state == State::kSelectWordCount || g_state == State::kSelectNetwork) {
+  if (g_state == State::kSelectWordCount || g_state == State::kSelectNetwork ||
+      g_state == State::kCardError) {
     return HeaderNet::kNone;
   }
   return g_network_choice == Network::kTestnet ? HeaderNet::kTestnet : HeaderNet::kMainnet;
@@ -638,6 +664,7 @@ void render() {
     case State::kPsbtConfirm: render_psbt_confirm(); break;
     case State::kPsbtDone: render_psbt_done(); break;
     case State::kError: render_error(); break;
+    case State::kCardError: render_card_error(); break;
     case State::kXpubChoice: render_xpub_choice(); break;
     case State::kXpubExport: render_xpub_export(); break;
     case State::kReceiveAddressEntry: render_receive_address_entry(); break;
@@ -764,11 +791,11 @@ void start_restore() {
   if (st == RfidIoStatus::kOk) st = rfid_read_all(g_rfid_card);
   rfid_release_card();
   if (st != RfidIoStatus::kOk) {
-    go_to_start(rfid_io_message(st));
+    show_card_error("FALHA NA LEITURA", rfid_io_message(st));
     return;
   }
   if (rfid_card_is_blank(g_rfid_card)) {
-    go_to_start("Cartao sem backup");
+    show_card_error("SEM BACKUP", "Cartao vazio, nada gravado");
     return;
   }
   g_card_pw.wipe();
@@ -793,7 +820,7 @@ void attempt_restore_decode() {
       set_status("Senha errada ou backup incompleto");
       break;
     default:
-      go_to_start("Cartao corrompido");
+      show_card_error("CORROMPIDO", "Conteudo do cartao invalido");
       break;
   }
 }
@@ -869,6 +896,7 @@ void do_xpub_export_raw() {
 }
 
 void do_xpub_export_download() {
+  g_sd_ok = sd_remount(); // cartao pode ter sido trocado desde a ultima montagem
   char xpub[XPUB_MAXLEN];
   if (!serialize_account_xpub(g_session.master_key(), xpub, sizeof(xpub))) {
     show_error("Falha no xpub", "erro ao serializar a conta");
@@ -1140,6 +1168,10 @@ void handle_key(const KeyEvent &key) {
         g_row = (g_row + n - 1) % n;
       } else if (key.ch == kKeyDown && n > 0) {
         g_row = (g_row + 1) % n;
+      } else if ((key.ch == 'r' || key.ch == 'R') && g_tab == kTabSign) {
+        refresh_psbt_list();
+        g_row = 0;
+        set_status(g_sd_ok ? "Cartao SD atualizado" : "Cartao SD nao encontrado");
       } else if (key.enter) {
         activate_menu_row();
       }
@@ -1173,6 +1205,10 @@ void handle_key(const KeyEvent &key) {
     case State::kPsbtConfirm:
       // Enter e tratado por update_hold() no loop (precisa do estado "segurado").
       if (key.esc) g_state = State::kPsbtReviewFee;
+      break;
+
+    case State::kCardError:
+      if (key.enter || key.esc) go_to_start("");
       break;
 
     case State::kPsbtDone:
@@ -1255,6 +1291,20 @@ void loop() {
   if ((pre_session && millis() - g_last_key_ms >= kSessionTimeoutMs) ||
       (g_session.is_active() && g_session.is_expired())) {
     go_to_start("Sessao encerrada por inatividade");
+    render();
+    return;
+  }
+
+  // So sem cartao montado: com cartao, remontar a toda hora atrapalharia a leitura.
+  if (g_state == State::kMainMenu && g_tab == kTabSign && !g_sd_ok &&
+      millis() - g_sd_last_poll_ms >= kSdPollMs) {
+    refresh_psbt_list();
+    g_row = 0;
+    render();
+  }
+
+  if (g_state == State::kCardError && millis() - g_card_error_since >= kCardErrorShowMs) {
+    go_to_start("");
     render();
     return;
   }

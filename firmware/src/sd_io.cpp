@@ -23,6 +23,9 @@ constexpr int kSdCsPin = 12;
 constexpr uint32_t kSdSpiHz = 25000000;
 
 bool g_sd_ready = false;
+bool g_spi_started = false;
+char g_psbt_dir[kMaxFilenameLen + 1] = {0};
+bool g_psbt_dir_known = false;
 
 bool directory_exists(const char *path) {
   File f = SD.open(path);
@@ -32,20 +35,20 @@ bool directory_exists(const char *path) {
   return is_dir;
 }
 
-// Resolve uma unica vez por sessao (SD montado) se os .psbt vivem em
-// kPsbtDir ou na raiz — secao 9 do spec permite as duas opcoes.
+// Resolve uma vez por montagem se os .psbt vivem em kPsbtDir ou na raiz —
+// secao 9 do spec permite as duas opcoes. sd_remount() invalida (outro cartao).
 const char *psbt_dir() {
-  static char resolved[kMaxFilenameLen + 1] = {0};
-  static bool computed = false;
-  if (!computed) {
-    if (directory_exists(kPsbtDir)) {
-      strncpy(resolved, kPsbtDir, sizeof(resolved) - 1);
-    } else {
-      strncpy(resolved, "/", sizeof(resolved) - 1);
-    }
-    computed = true;
+  if (!g_psbt_dir_known) {
+    strncpy(g_psbt_dir, directory_exists(kPsbtDir) ? kPsbtDir : "/", sizeof(g_psbt_dir) - 1);
+    g_psbt_dir_known = true;
   }
-  return resolved;
+  return g_psbt_dir;
+}
+
+bool mount() {
+  g_psbt_dir_known = false;
+  g_sd_ready = SD.begin(kSdCsPin, SPI, kSdSpiHz) && SD.cardType() != CARD_NONE;
+  return g_sd_ready;
 }
 
 // Escreve em um arquivo temporario e so renomeia para `final_path` se a
@@ -82,9 +85,19 @@ bool write_file_atomic(const char *final_path, const uint8_t *data,
 } // namespace
 
 bool sd_init() {
-  SPI.begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
-  g_sd_ready = SD.begin(kSdCsPin, SPI, kSdSpiHz) && SD.cardType() != CARD_NONE;
-  return g_sd_ready;
+  if (!g_spi_started) {
+    SPI.begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
+    g_spi_started = true;
+  }
+  return mount();
+}
+
+bool sd_remount() {
+  if (!g_spi_started) return sd_init();
+  // Desmonta sempre: com o cartao trocado, a FAT em cache seria a do anterior.
+  SD.end();
+  g_sd_ready = false;
+  return mount();
 }
 
 int list_psbt_files(PsbtFileEntry *out, int max_files) {

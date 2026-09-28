@@ -52,6 +52,10 @@ struct PsbtFileEntry {
 // falhar (nesse caso nenhuma operacao de PSBT deve prosseguir).
 bool sd_init();
 
+// Desmonta e monta de novo (cartao inserido, removido ou trocado com o
+// aparelho ligado). Retorna o mesmo que sd_init().
+bool sd_remount();
+
 // Lista arquivos terminados em kPsbtExtension dentro de kPsbtDir; se esse
 // diretorio nao existir no cartao, cai para a raiz. Nomes que nao passem
 // em sanitize_filename() sao silenciosamente ignorados (nao aparecem no
