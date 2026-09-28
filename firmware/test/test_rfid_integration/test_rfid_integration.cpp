@@ -45,10 +45,11 @@ void mifare_factory_reset() {
   for (int s = 0; s < kMifareSectors; s++) memcpy(g_mifare[s * 4 + 3], kFactoryTrailer, 16);
 }
 
-// Mesmo percurso de rfid_write_all()/rfid_read_all(); `blocks` < 47 simula
-// o cartao afastado no meio da gravacao.
+// Mesmo percurso de rfid_write_all() (copia A por ultimo) e rfid_read_all();
+// `blocks` < 47 simula o cartao afastado no meio da gravacao.
 void mifare_write(const uint8_t data[kMifareUsableBytes], int blocks = kMifareUsableBlocks) {
-  for (int i = 0; i < blocks; i++) {
+  for (int step = 0; step < blocks; step++) {
+    int i = rfid_write_order_index(step);
     memcpy(g_mifare[mifare_physical_block_for_index(i)], data + i * kMifareBlockSize, 16);
   }
 }
@@ -291,32 +292,39 @@ static void test_blank_card_is_detected(void) {
                         static_cast<int>(restore_session(kCardPassword, "", &mk)));
 }
 
-static void test_interrupted_write_never_yields_a_seed(void) {
-  // Backup antigo com uma senha antiga, depois gravacao nova interrompida.
+static void test_interrupted_write_keeps_old_or_new_backup(void) {
+  // Backup antigo (kMnemonic, senha antiga) e uma gravacao nova de OUTRA seed
+  // com outra senha, interrompida em cada bloco possivel.
+  const char *new_mnemonic =
+      "legal winner thank year wave sausage worth useful legal winner thank yellow";
+  const char *new_pw = "outra senha longa e diferente";
   char zpub[XPUB_MAXLEN];
   uint32_t fp = 0;
   first_session_with_backup("", zpub, &fp);
-  type_mnemonic(kMnemonic);
-  type_text(&g_card_pw, "outra senha longa e diferente");
-  TEST_ASSERT_TRUE(rfid_encode_backup(g_card_pw.value(), static_cast<size_t>(g_card_pw.length()),
-                                      g_mnemonic_text, kIters, g_card_blob));
-  const char *new_pw = "outra senha longa e diferente";
-  for (int blocks = 1; blocks < kMifareUsableBlocks; blocks += 5) {
+  uint8_t old_card[kMifareUsableBytes];
+  mifare_read(old_card);
+  TEST_ASSERT_TRUE(rfid_encode_backup(new_pw, strlen(new_pw), new_mnemonic, kIters, g_card_blob));
+
+  char out[BIP39_MAX_MNEMONIC_LEN + 1];
+  for (int blocks = 0; blocks <= kMifareUsableBlocks; blocks++) {
+    mifare_factory_reset();
+    mifare_write(old_card);
     mifare_write(g_card_blob, blocks);
     TEST_ASSERT_TRUE(mifare_structure_intact());
     mifare_read(g_dump);
-    // Com menos de 7 blocos novos (os 112 bytes autenticados), nenhuma senha abre.
-    if (blocks < static_cast<int>(kRfidUsedLen / kMifareBlockSize)) {
-      char out[BIP39_MAX_MNEMONIC_LEN + 1];
-      TEST_ASSERT_NOT_EQUAL(static_cast<int>(RfidCardStatus::kOk),
-                            static_cast<int>(rfid_decode_backup(kCardPassword, strlen(kCardPassword),
-                                                                g_dump, kIters, out, sizeof(out))));
-      TEST_ASSERT_NOT_EQUAL(static_cast<int>(RfidCardStatus::kOk),
-                            static_cast<int>(rfid_decode_backup(new_pw, strlen(new_pw), g_dump,
-                                                                kIters, out, sizeof(out))));
-      TEST_ASSERT_TRUE(all_zero(out, sizeof(out)));
-    }
+
+    bool old_ok = rfid_decode_backup(kCardPassword, strlen(kCardPassword), g_dump, kIters, out,
+                                     sizeof(out)) == RfidCardStatus::kOk;
+    if (old_ok) TEST_ASSERT_EQUAL_STRING(kMnemonic, out);
+    bool new_ok = rfid_decode_backup(new_pw, strlen(new_pw), g_dump, kIters, out, sizeof(out)) ==
+                  RfidCardStatus::kOk;
+    if (new_ok) TEST_ASSERT_EQUAL_STRING(new_mnemonic, out);
+    TEST_ASSERT_TRUE_MESSAGE(old_ok || new_ok, "gravacao interrompida perdeu os dois backups");
+    TEST_ASSERT_TRUE(rfid_scratch_is_clear());
+    // Gravacao completa: o antigo nao abre mais.
+    if (blocks == kMifareUsableBlocks) TEST_ASSERT_FALSE(old_ok);
   }
+  memzero(out, sizeof(out));
 }
 
 static void test_new_backup_leaves_nothing_of_the_old_one(void) {
@@ -336,6 +344,21 @@ static void test_new_backup_leaves_nothing_of_the_old_one(void) {
   TEST_ASSERT_EQUAL_INT(static_cast<int>(RfidCardStatus::kOk),
                         static_cast<int>(restore_session(kCardPassword, "", &mk)));
   TEST_ASSERT_EQUAL_HEX32(fp, mk.master_fingerprint);
+}
+
+static void test_erase_leaves_blank_card(void) {
+  // TOOLS > Apagar backup: grava rfid_blank_image() pelo mesmo percurso.
+  char zpub[XPUB_MAXLEN];
+  uint32_t fp = 0;
+  first_session_with_backup("", zpub, &fp);
+  rfid_blank_image(g_card_blob);
+  mifare_write(g_card_blob);
+  TEST_ASSERT_TRUE(mifare_structure_intact());
+  mifare_read(g_dump);
+  TEST_ASSERT_TRUE(rfid_card_is_blank(g_dump));
+  MasterKey mk;
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(RfidCardStatus::kBlank),
+                        static_cast<int>(restore_session(kCardPassword, "", &mk)));
 }
 
 static void test_24_word_seed_roundtrip_through_card(void) {
@@ -372,8 +395,9 @@ int main(int argc, char **argv) {
   RUN_TEST(test_card_dump_reveals_nothing);
   RUN_TEST(test_wrong_password_restores_nothing);
   RUN_TEST(test_blank_card_is_detected);
-  RUN_TEST(test_interrupted_write_never_yields_a_seed);
+  RUN_TEST(test_interrupted_write_keeps_old_or_new_backup);
   RUN_TEST(test_new_backup_leaves_nothing_of_the_old_one);
+  RUN_TEST(test_erase_leaves_blank_card);
   RUN_TEST(test_24_word_seed_roundtrip_through_card);
   return UNITY_END();
 }

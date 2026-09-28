@@ -15,7 +15,7 @@ enum class RfidIoStatus {
   kNoReader,        // Unit RFID2 nao responde no I2C
   kNoCard,          // nenhum cartao encostado dentro do timeout
   kUnsupportedCard, // nao e MIFARE Classic 1K/4K
-  kAccessDenied,    // Key A de fabrica recusada (access bits nao-padrao)
+  kAccessDenied,    // nenhuma chave de kMifareKeys aceita (access bits/chave nao-padrao)
   kIoError,         // cartao afastado no meio da operacao, CRC etc.
   kVerifyFailed,    // releitura apos gravar nao confere
   kCardChanged,     // outro cartao (UID diferente) no lugar do detectado
@@ -30,7 +30,7 @@ RfidIoStatus rfid_wait_for_card(uint32_t timeout_ms);
 
 // Operam sobre o cartao detectado por rfid_wait_for_card(): cada chamada o
 // reseleciona e exige o mesmo UID. Sempre os 47 blocos de dados, nunca
-// trailers nem o bloco 0.
+// trailers nem o bloco 0. A gravacao deixa a copia A por ultimo.
 RfidIoStatus rfid_read_all(uint8_t out[kMifareUsableBytes]);
 RfidIoStatus rfid_write_all(const uint8_t in[kMifareUsableBytes]);
 // Rele o cartao e compara com o que acabou de ser gravado.

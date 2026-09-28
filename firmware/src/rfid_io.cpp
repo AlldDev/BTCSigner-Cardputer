@@ -9,6 +9,10 @@
 // reselecionando o cartao (ciclo do campo de RF -> IDLE -> WUPA -> select), e
 // os setores seguintes usam autenticacao aninhada (sem StopCrypto1 entre eles),
 // como o proprio upstream faz em PICC_DumpMifareClassicToSerial().
+//
+// Chaves: tenta kMifareKeys em ordem (fabrica, 00..00 de copias, Key B) e
+// guarda a que funcionou para os setores seguintes. Uma autenticacao recusada
+// deixa o cartao em HALT, entao cada nova chave comeca com uma reselecao.
 #include "rfid_io.h"
 
 #include <Arduino.h>
@@ -20,7 +24,7 @@ extern "C" {
 #include "memzero.h"
 }
 
-#include "rfid_seed_card.h" // mifare_physical_block_for_index
+#include "rfid_seed_card.h" // mifare_physical_block_for_index, rfid_write_order_index
 
 namespace btcseed {
 namespace {
@@ -38,6 +42,7 @@ bool g_wire_started = false;
 bool g_reader_ready = false;
 MFRC522_I2C::Uid g_card_uid{}; // cartao detectado por rfid_wait_for_card()
 bool g_card_known = false;
+int g_key_idx = 0; // ultima chave de kMifareKeys que o cartao aceitou
 uint8_t g_block_buf[18]; // MIFARE_Read exige 16 + 2 de CRC
 uint8_t g_verify_buf[kMifareUsableBytes];
 
@@ -89,34 +94,48 @@ RfidIoStatus reselect_card() {
   return RfidIoStatus::kOk;
 }
 
-bool authenticate(int block) {
+bool try_key(int k, int block) {
   MFRC522_I2C::MIFARE_Key key;
-  memcpy(key.keyByte, kMifareDefaultKeyA, sizeof(key.keyByte));
-  byte status = g_reader.PCD_Authenticate(MFRC522_I2C::PICC_CMD_MF_AUTH_KEY_A,
-                                          static_cast<byte>(block), &key, &g_reader.uid);
+  memcpy(key.keyByte, kMifareKeys[k].key, sizeof(key.keyByte));
+  byte cmd = kMifareKeys[k].key_b ? MFRC522_I2C::PICC_CMD_MF_AUTH_KEY_B
+                                  : MFRC522_I2C::PICC_CMD_MF_AUTH_KEY_A;
+  byte status = g_reader.PCD_Authenticate(cmd, static_cast<byte>(block), &key, &g_reader.uid);
+  memzero(&key, sizeof(key));
   return status == MFRC522_I2C::STATUS_OK;
 }
 
-// Percorre os 47 blocos de dados, autenticando cada setor uma vez.
+// Autenticacao aninhada com a ultima chave aceita; se o cartao recusar, uma
+// tentativa limpa (reselecao) por chave, comecando pela mesma.
+RfidIoStatus authenticate(int block) {
+  if (try_key(g_key_idx, block)) return RfidIoStatus::kOk;
+  for (int n = 0; n < kMifareKeyCount; n++) {
+    int k = (g_key_idx + n) % kMifareKeyCount;
+    RfidIoStatus st = reselect_card();
+    if (st != RfidIoStatus::kOk) return st;
+    if (try_key(k, block)) {
+      g_key_idx = k;
+      return RfidIoStatus::kOk;
+    }
+  }
+  return RfidIoStatus::kAccessDenied;
+}
+
+int identity_order(int step) { return step; }
+
+// Percorre os 47 blocos de dados na ordem dada (passo -> indice de dados),
+// autenticando de novo a cada troca de setor.
 template <typename Fn>
-RfidIoStatus for_each_block(Fn fn) {
+RfidIoStatus for_each_block(int (*order)(int), Fn fn) {
   RfidIoStatus st = reselect_card();
   if (st != RfidIoStatus::kOk) return st;
   int authed_sector = -1;
-  for (int i = 0; i < kMifareUsableBlocks && st == RfidIoStatus::kOk; i++) {
+  for (int step = 0; step < kMifareUsableBlocks && st == RfidIoStatus::kOk; step++) {
+    int i = order(step);
     int block = mifare_physical_block_for_index(i);
     int sector = block / kBlocksPerSector;
     if (sector != authed_sector) {
-      // Autenticacao aninhada; se o cartao nao aceitar, uma tentativa limpa.
-      bool ok = authenticate(block);
-      if (!ok) {
-        st = reselect_card();
-        ok = st == RfidIoStatus::kOk && authenticate(block);
-      }
-      if (!ok) {
-        if (st == RfidIoStatus::kOk) st = RfidIoStatus::kAccessDenied;
-        break;
-      }
+      st = authenticate(block);
+      if (st != RfidIoStatus::kOk) break;
       authed_sector = sector;
     }
     if (!fn(i, block)) st = RfidIoStatus::kIoError;
@@ -126,7 +145,7 @@ RfidIoStatus for_each_block(Fn fn) {
 }
 
 RfidIoStatus read_into(uint8_t *out) {
-  RfidIoStatus st = for_each_block([out](int i, int block) {
+  RfidIoStatus st = for_each_block(identity_order, [out](int i, int block) {
     byte size = sizeof(g_block_buf);
     if (g_reader.MIFARE_Read(static_cast<byte>(block), g_block_buf, &size) !=
             MFRC522_I2C::STATUS_OK ||
@@ -160,6 +179,7 @@ RfidIoStatus rfid_init() {
 RfidIoStatus rfid_wait_for_card(uint32_t timeout_ms) {
   if (!g_reader_ready || !reader_responds()) return RfidIoStatus::kNoReader;
   g_card_known = false;
+  g_key_idx = 0;
   g_reader.PCD_AntennaOn();
   uint32_t start = millis();
   while (millis() - start < timeout_ms) {
@@ -185,8 +205,10 @@ RfidIoStatus rfid_read_all(uint8_t out[kMifareUsableBytes]) {
   return st;
 }
 
+// Copia A por ultimo (rfid_write_order_index): interrompida, a gravacao deixa
+// o backup antigo ou o novo legivel.
 RfidIoStatus rfid_write_all(const uint8_t in[kMifareUsableBytes]) {
-  return for_each_block([in](int i, int block) {
+  return for_each_block(rfid_write_order_index, [in](int i, int block) {
     memcpy(g_block_buf, in + i * kMifareBlockSize, kMifareBlockSize);
     bool ok = g_reader.MIFARE_Write(static_cast<byte>(block), g_block_buf, kMifareBlockSize) ==
               MFRC522_I2C::STATUS_OK;

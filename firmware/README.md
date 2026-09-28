@@ -129,7 +129,8 @@ tem a E/S de fato (Arduino `SD.h`/`SPI.h`) e só compila no ambiente `cardputer`
 Recurso **opt-in**: por padrão nada muda, e a seed continua sendo digitada a cada sessão. Depois de
 confirmar o fingerprint de uma seed **digitada**, o firmware oferece gravar uma cópia cifrada num
 cartão MIFARE Classic 1K/4K pela **M5Stack Unit RFID2** (chip WS1850S, compatível com o MFRC522).
-Na tela inicial, "Restaurar do cartão" lê essa cópia em vez de pedir as palavras. A **passphrase
+Na tela inicial, "Restaurar do cartão" lê essa cópia em vez de pedir as palavras. Durante a sessão,
+a aba **TOOLS** permite testar a senha e a integridade do backup e apagá-lo. A **passphrase
 nunca vai para o cartão**: ela continua sendo digitada depois da restauração, então segue valendo
 como segundo fator.
 
@@ -148,20 +149,35 @@ UID detectado no início, o que acusa um cartão trocado. Os setores seguintes u
 aninhada, sem `StopCrypto1` entre eles, como faz o próprio `PICC_DumpMifareClassicToSerial()` do
 upstream. Como os testes no host simulam o cartão, esse ponto **só é validado no aparelho**.
 
+**Chaves do cartão.** O firmware tenta, em ordem, a Key A de fábrica `FFFFFFFFFFFF`, a Key A
+`000000000000` e a Key B `FFFFFFFFFFFF` (`kMifareKeys`), guardando a que funcionou para os setores
+seguintes. A segunda existe por causa de cópias: no trailer, a Key A não é legível e sai zerada no
+dump, e uma ferramenta que grave o trailer como está no dump deixa o clone com Key A = 00..00. Uma
+chave recusada deixa o cartão em HALT, por isso cada nova tentativa começa com uma reseleção. Os
+trailers nunca são escritos.
+
 **O cartão é tratado como público.** A proteção nativa do MIFARE Classic (Crypto1) está quebrada, e
-o firmware usa a Key A de fábrica só para ter acesso de leitura e escrita. Quem pegar o cartão copia
+o firmware usa as chaves de fábrica só para ter acesso de leitura e escrita. Quem pegar o cartão copia
 tudo em segundos. Por isso toda a segurança vem da cifra (`src/rfid_seed_card.h`):
 
 ```
-[0,16)    salt       [16,32) iv       [32,80) AES-256-CBC de 48 bytes fixos
-[80,112)  HMAC-SHA256(mac_key, [0,80))       [112,752) bytes aleatórios
+cartão (752 bytes): cópia A em [0,112), cópia B em [384,496), resto aleatório
+cada cópia: +0 salt(16) | +16 iv(16) | +32 AES-256-CBC de 48 bytes fixos | +80 HMAC-SHA256(mac_key, [+0,+80))
 texto plano: versão | nº de palavras (12|24) | entropia BIP39 (slot de 32) | aleatório
 master = PBKDF2-HMAC-SHA256(senha, salt, kRfidPbkdf2Iterations), 1 bloco de 32 bytes
 aes_key/mac_key = HMAC-SHA256(master, "BTCSigner-RFID-v1-enc" / "...-mac")
 ```
 
+- **Duas cópias, a A gravada por último.** As cópias são independentes (salt, IV e chaves
+  próprios, então nenhum trecho se repete e o cartão continua parecendo aleatório). A gravação
+  (`rfid_write_order_index`) escreve primeiro a cópia B e o preenchimento e só depois os 7 blocos da
+  cópia A. Se o cartão sair do leitor no meio, sobra sempre um backup legível: o antigo (A intacta)
+  ou o novo (B completa). A restauração tenta A e depois B, então uma senha errada custa dois KDFs.
+  O backup também custa dois KDFs. A tela de falha avisa isso, e o ESC só pula o backup no segundo
+  toque, porque depois dele o mnemônico sai da RAM.
+
 - **Indistinguível de dados aleatórios.** Não há magic, versão nem contagem de iterações em
-  claro, e o blob tem o mesmo tamanho para 12 ou 24 palavras. Os 47 blocos de dados são sempre
+  claro, e o conteúdo tem o mesmo tamanho para 12 ou 24 palavras. Os 47 blocos de dados são sempre
   regravados, então não sobra nada de um backup anterior.
 - **Entropia real para salt, IV e preenchimento.** Sem WiFi/BT, o `esp_random()` é só
   pseudoaleatório; o `strong_random_buffer()` liga a fonte de ruído do SAR ADC
@@ -182,15 +198,25 @@ aes_key/mac_key = HMAC-SHA256(master, "BTCSigner-RFID-v1-enc" / "...-mac")
   cai rápido; não medem força de verdade. A cifra
   acontece antes de tocar no cartão, e a senha é zerada logo depois. Depois de gravar, o cartão é
   relido e comparado. Um cartão com dados pede confirmação antes de ser sobrescrito.
+- **TOOLS > Testar backup RFID.** Lê o cartão, pede a senha e decifra só para conferir. O
+  mnemônico é zerado antes de qualquer desenho e nunca aparece na tela. Mostra o número de palavras
+  e qual cópia abriu. Se só a B abriu, a A está danificada, e a tela pede para gravar de novo. O
+  teste não compara com a seed da sessão, porque o mnemônico e a passphrase já saíram da RAM.
+- **TOOLS > Apagar backup RFID.** Lê o cartão (se já estiver vazio, avisa), pede para segurar
+  Enter e grava zeros nos 47 blocos, conferindo depois. Não pede a senha de propósito: qualquer app
+  NFC já apaga o cartão com a chave de fábrica, e exigir a senha impediria apagar um backup cuja
+  senha foi esquecida. Como a cópia A é zerada por último, uma interrupção pode deixar o backup no
+  cartão, e a tela avisa.
 - **Erros da restauração em tela cheia.** Leitor ausente, cartão sem backup ou corrompido aparecem
   numa tela de erro por 3 s (`kCardErrorShowMs`), que volta sozinha ao início (Enter/Esc voltam
   antes). Tudo é zerado antes da tela aparecer. Senha errada continua na tela de senha, para tentar
   de novo.
-- **`kRfidPbkdf2Iterations` (`config.h`)** é provisório (200k). A tela de sucesso mostra quanto o
-  KDF levou; calibrar no aparelho para cerca de 5 a 8 s. O valor não fica gravado no cartão, então
-  mudá-lo invalida os backups existentes (o que exige regravar). Isso é consequência de não ter
-  cabeçalho em claro: senha errada, gravação incompleta e backup de outra versão aparecem todos como
-  "Senha errada ou backup incompleto".
+- **`kRfidPbkdf2Iterations` (`config.h`) está congelado em 200k.** O valor não fica gravado no
+  cartão (não há cabeçalho em claro), então mudá-lo tornaria ilegível todo backup existente, e o
+  erro pareceria "senha errada". Um vetor golden com as iterações de produção
+  (`test_production_iterations_are_frozen`) quebra se o valor mudar. Para mudar no futuro, a
+  restauração precisa continuar tentando os valores antigos. A tela de sucesso mostra quanto o KDF
+  levou (as duas cópias juntas).
 - **Bateria depois do backup.** O `bootloader_random_disable()` reinicia o SAR ADC, e a leitura de
   bateria do cabeçalho pode ficar errada até o aparelho reiniciar. É só cosmético, mas precisa ser
   conferido no aparelho.
@@ -222,8 +248,8 @@ ASCII (a fonte 6x8 do M5GFX não tem acentos).
 
 - **Menu em abas**: `,` `/` trocam de aba, `;` `.` movem, Enter abre. ASSINAR = lista de `.psbt`
   do SD; CARTEIRA = fingerprint, rede, script, exportar xpub, endereço de recebimento; SESSAO =
-  brilho (Enter cicla 30/50/70/100%, não persiste), bloqueio automático (informativo) e encerrar
-  sessão.
+  bloqueio automático (informativo) e encerrar sessão; TOOLS = testar e apagar o backup RFID e
+  brilho (Enter cicla 30/50/70/100%, não persiste).
 - **Fontes**: conteúdo em `AsciiFont8x16` (29 caracteres/linha com margem de 4 px),
   header/rodapé/rótulos em 6x8. Endereços sempre completos: P2WPKH ocupa 2 linhas, P2WSH/P2TR 3. Se
   não couber, `draw_address` cai para 6x8 em vez de cortar. A quebra (`wrap_next_line`) é testada
@@ -317,8 +343,10 @@ Vetores e casos cobertos:
   array de scriptCode com um elemento a menos, que deslocava `OP_EQUALVERIFY`/`OP_CHECKSIG`). Casos
   maliciosos/malformados: fingerprint errado, sighash ≠ ALL, troco falsificado, arquivo truncado,
   magic corrompido, scriptSig não-vazio na unsigned tx, round-trip binário/base64, entre outros.
-- **Backup RFID**: vetor fixo gerado por uma implementação independente (Python: `hashlib` +
-  `cryptography`) com RNG de contador, tanto para codificar quanto para decodificar; round-trip de
+- **Backup RFID**: vetores fixos gerados por uma implementação independente (Python: `hashlib` +
+  `cryptography`) com RNG de contador, das duas cópias, com 1000 iterações e com as de produção,
+  tanto para codificar quanto para decodificar; uma cópia danificada cai para a outra; as cópias não
+  compartilham nenhum bloco; a ordem de gravação deixa a cópia A por último; round-trip de
   12 e 24 palavras (inclusive com as iterações de produção); senha errada, prefixo da senha,
   iterações diferentes e 1 byte alterado em salt/iv/ciphertext/tag viram `kAuthFailed`, com a saída
   zerada; cartão de fábrica (0x00/0xFF) é detectado; MAC válido com conteúdo inválido vira
@@ -326,7 +354,9 @@ Vetores e casos cobertos:
   entropia ou das palavras aparece no cartão; mapeamento de blocos nunca toca trailer nem bloco 0.
   `test_rfid_integration` percorre o fluxo inteiro (digitar → derivar → backup → cartão simulado →
   restaurar → mesma MasterKey e zpub), confere que o cartão restaurado sem a passphrase gera outra
-  carteira e confere que nenhum segredo sobra nos buffers.
+  carteira e confere que nenhum segredo sobra nos buffers. Uma gravação de outra seed interrompida
+  em cada bloco possível sempre deixa o backup antigo ou o novo legível, e apagar deixa o cartão
+  vazio.
 
 ---
 
@@ -449,7 +479,8 @@ perde:
   carteira protegida pela passphrase. Quem não usa passphrase fica só com a senha do cartão.
 - **Não há bloqueio por tentativas.** Não teria efeito, já que o ataque real é offline sobre a cópia.
 - **O cartão não substitui o backup em papel.** Cartões falham, e mudar
-  `kRfidPbkdf2Iterations` ou o formato invalida os backups gravados.
+  `kRfidPbkdf2Iterations` ou o formato invalida os backups gravados. Qualquer pessoa com o cartão na
+  mão pode apagá-lo.
 - **Resíduo de stack.** Funções internas do SHA-256 do trezor-crypto podem deixar resíduo na stack
   durante o KDF, a mesma limitação que o caminho BIP39 já aceita (sem secure element, veja acima).
 

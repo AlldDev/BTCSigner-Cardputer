@@ -148,6 +148,14 @@ libsecp256k1 (Bitcoin Core's library) is **not** used; trezor-crypto's own `secp
   (password inputs, card buffers, `rfid_wipe_scratch()`, `mnemonic_clear()`) is covered by
   `wipe_seed_material()`. The backup offer only exists between fingerprint confirmation and
   `confirm_fingerprint_and_start_session()`, the last moment the mnemonic is still in RAM.
+- The card holds two independent copies (A at 0, B at 384; own salt/IV/keys, no repeated bytes).
+  `rfid_write_all` follows `rfid_write_order_index`, which writes copy A **last**, so an interrupted
+  write always leaves the old or the new backup readable. Keep that order and the host test
+  `test_interrupted_write_keeps_old_or_new_backup` in sync.
+- `kRfidPbkdf2Iterations` is frozen: it isn't stored on the card, and `test_production_iterations_are_frozen`
+  pins it. Changing it requires restore to keep trying the old value.
+- TOOLS > Testar backup decrypts only to verify: the mnemonic is zeroed before anything is drawn and
+  is never shown. Sector trailers are never written; auth tries `kMifareKeys` in order.
 - Never call the `PICC_Dump*`/`PCD_DumpVersionToSerial` functions of `MFRC522_I2C`, and don't add
   `Serial`/`ESP_LOG` output to `rfid_*` files.
 - PSBT validation is fail-closed by design: anything the parser can't fully verify (unrecognized

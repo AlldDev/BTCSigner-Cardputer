@@ -27,6 +27,7 @@ constexpr size_t kOffTag = kOffCiphertext + kRfidPlainLen;
 constexpr size_t kPlainOffWords = 1;
 constexpr size_t kPlainOffEntropy = 2;
 constexpr size_t kEntropySlotLen = 32;
+constexpr int kSlotABlocks = static_cast<int>(kRfidUsedLen / kMifareBlockSize); // 7
 
 static_assert(kOffTag + kRfidTagLen == kRfidUsedLen, "layout do blob inconsistente");
 static_assert(kPlainOffEntropy + kEntropySlotLen <= kRfidPlainLen, "slot de entropia nao cabe");
@@ -98,21 +99,24 @@ bool rfid_encode_backup(const char *password, size_t password_len, const char *m
     ok = (g_scratch.digest[0] & mask) == (g_scratch.bits[ent_len] & mask);
 
     if (ok) {
-      // salt, iv e o preenchimento [112,752) de uma vez; o miolo e sobrescrito.
+      // salt, iv e o preenchimento de uma vez; o miolo de cada copia e sobrescrito.
       rng(out, kMifareUsableBytes);
+    }
+    for (int slot = 0; ok && slot < kRfidSlotCount; slot++) {
+      uint8_t *base = out + kRfidSlotOffsets[slot];
       rng(g_scratch.plain, sizeof(g_scratch.plain));
       g_scratch.plain[0] = kPlainVersion;
       g_scratch.plain[kPlainOffWords] = static_cast<uint8_t>(words);
       memcpy(g_scratch.plain + kPlainOffEntropy, g_scratch.bits, ent_len);
 
-      derive_keys(password, password_len, out + kOffSalt, iterations);
-      memcpy(g_scratch.iv, out + kOffIv, kRfidIvLen);
+      derive_keys(password, password_len, base + kOffSalt, iterations);
+      memcpy(g_scratch.iv, base + kOffIv, kRfidIvLen);
       ok = aes_encrypt_key256(g_scratch.aes_key, &g_scratch.enc) == EXIT_SUCCESS &&
-           aes_cbc_encrypt(g_scratch.plain, out + kOffCiphertext,
+           aes_cbc_encrypt(g_scratch.plain, base + kOffCiphertext,
                            static_cast<int>(kRfidPlainLen), g_scratch.iv,
                            &g_scratch.enc) == EXIT_SUCCESS;
       if (ok) {
-        hmac_sha256(g_scratch.mac_key, kKeyLen, out, kOffTag, out + kOffTag);
+        hmac_sha256(g_scratch.mac_key, kKeyLen, base, kOffTag, base + kOffTag);
       }
     }
   }
@@ -122,31 +126,23 @@ bool rfid_encode_backup(const char *password, size_t password_len, const char *m
   return ok;
 }
 
-RfidCardStatus rfid_decode_backup(const char *password, size_t password_len,
-                                  const uint8_t card[kMifareUsableBytes], uint32_t iterations,
-                                  char *out_mnemonic, size_t out_cap) {
-  if (out_mnemonic != nullptr && out_cap > 0) memzero(out_mnemonic, out_cap);
-  if (card == nullptr || out_mnemonic == nullptr || out_cap < BIP39_MAX_MNEMONIC_LEN + 1) {
-    return RfidCardStatus::kMalformed;
-  }
-  if (rfid_card_is_blank(card)) return RfidCardStatus::kBlank;
-  if (password == nullptr || password_len == 0 || iterations == 0) {
-    return RfidCardStatus::kAuthFailed;
-  }
+namespace {
 
-  derive_keys(password, password_len, card + kOffSalt, iterations);
+// Uma copia. Deixa o scratch zerado; out_mnemonic so e escrito em kOk.
+RfidCardStatus decode_slot(const char *password, size_t password_len, const uint8_t *base,
+                           uint32_t iterations, char *out_mnemonic, size_t out_cap) {
+  derive_keys(password, password_len, base + kOffSalt, iterations);
 
   // MAC antes de qualquer decifragem.
-  hmac_sha256(g_scratch.mac_key, kKeyLen, card, kOffTag, g_scratch.digest);
-  if (!consteq(g_scratch.digest, card + kOffTag, kRfidTagLen)) {
+  hmac_sha256(g_scratch.mac_key, kKeyLen, base, kOffTag, g_scratch.digest);
+  if (!consteq(g_scratch.digest, base + kOffTag, kRfidTagLen)) {
     rfid_wipe_scratch();
-    scrub_stack();
     return RfidCardStatus::kAuthFailed;
   }
 
-  memcpy(g_scratch.iv, card + kOffIv, kRfidIvLen);
+  memcpy(g_scratch.iv, base + kOffIv, kRfidIvLen);
   bool ok = aes_decrypt_key256(g_scratch.aes_key, &g_scratch.dec) == EXIT_SUCCESS &&
-            aes_cbc_decrypt(card + kOffCiphertext, g_scratch.plain,
+            aes_cbc_decrypt(base + kOffCiphertext, g_scratch.plain,
                             static_cast<int>(kRfidPlainLen), g_scratch.iv,
                             &g_scratch.dec) == EXIT_SUCCESS;
   int words = g_scratch.plain[kPlainOffWords];
@@ -166,8 +162,39 @@ RfidCardStatus rfid_decode_backup(const char *password, size_t password_len,
     }
     mnemonic_clear();
   }
-  if (status != RfidCardStatus::kOk) memzero(out_mnemonic, out_cap);
   rfid_wipe_scratch();
+  return status;
+}
+
+} // namespace
+
+RfidCardStatus rfid_decode_backup(const char *password, size_t password_len,
+                                  const uint8_t card[kMifareUsableBytes], uint32_t iterations,
+                                  char *out_mnemonic, size_t out_cap, int *out_slot) {
+  if (out_slot != nullptr) *out_slot = -1;
+  if (out_mnemonic != nullptr && out_cap > 0) memzero(out_mnemonic, out_cap);
+  if (card == nullptr || out_mnemonic == nullptr || out_cap < BIP39_MAX_MNEMONIC_LEN + 1) {
+    return RfidCardStatus::kMalformed;
+  }
+  if (rfid_card_is_blank(card)) return RfidCardStatus::kBlank;
+  if (password == nullptr || password_len == 0 || iterations == 0) {
+    return RfidCardStatus::kAuthFailed;
+  }
+
+  // kAuthFailed so se nenhuma copia autenticar; MAC valido com conteudo
+  // invalido numa copia nao impede tentar a outra.
+  RfidCardStatus status = RfidCardStatus::kAuthFailed;
+  for (int slot = 0; slot < kRfidSlotCount; slot++) {
+    RfidCardStatus st = decode_slot(password, password_len, card + kRfidSlotOffsets[slot],
+                                    iterations, out_mnemonic, out_cap);
+    if (st == RfidCardStatus::kOk) {
+      if (out_slot != nullptr) *out_slot = slot;
+      status = st;
+      break;
+    }
+    if (st == RfidCardStatus::kMalformed) status = st;
+  }
+  if (status != RfidCardStatus::kOk) memzero(out_mnemonic, out_cap);
   scrub_stack();
   return status;
 }
@@ -204,12 +231,22 @@ bool rfid_card_is_blank(const uint8_t card[kMifareUsableBytes]) {
   return all_zero || all_ff;
 }
 
+void rfid_blank_image(uint8_t out[kMifareUsableBytes]) {
+  if (out != nullptr) memzero(out, kMifareUsableBytes);
+}
+
 int mifare_physical_block_for_index(int data_block_index) {
   if (data_block_index < 0 || data_block_index >= kMifareUsableBlocks) return -1;
   if (data_block_index < 2) return data_block_index + 1; // setor 0: blocos 1 e 2
   int j = data_block_index - 2;
   int sector = 1 + j / 3;
   return sector * 4 + j % 3;
+}
+
+int rfid_write_order_index(int step) {
+  if (step < 0 || step >= kMifareUsableBlocks) return -1;
+  int after_a = kMifareUsableBlocks - kSlotABlocks;
+  return step < after_a ? step + kSlotABlocks : step - after_a;
 }
 
 void rfid_wipe_scratch() { memzero(&g_scratch, sizeof(g_scratch)); }

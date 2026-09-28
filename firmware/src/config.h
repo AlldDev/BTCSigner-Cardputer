@@ -80,8 +80,11 @@ constexpr uint32_t kSdPollMs = 2000;
 
 // --- Backup opcional cifrado da seed em cartao MIFARE Classic (Unit RFID2) ---
 // O cartao e legivel por qualquer um (chave de fabrica + Crypto1 quebrado):
-// a unica protecao e senha x custo do KDF. Valor provisorio, a ser fixado
-// por benchmark no aparelho (meta: ~5-8 s por backup/restauracao).
+// a unica protecao e senha x custo do KDF.
+// FORMATO CONGELADO: o valor nao fica gravado no cartao, entao muda-lo torna
+// ilegivel todo cartao ja gravado (o erro parece "senha errada"). O vetor
+// golden de producao em test_rfid_seed_card trava este numero. Para mudar no
+// futuro, a restauracao tem que continuar tentando os valores antigos.
 constexpr uint32_t kRfidPbkdf2Iterations = 200000;
 // Com o cartao copiado, a senha e atacada offline em GPU: PINs curtos caem em
 // segundos. 12 caracteres e o piso; a tela recomenda 4-6 palavras aleatorias.
@@ -91,12 +94,17 @@ constexpr uint32_t kRfidCardWaitTimeoutMs = 8000;
 // Tela cheia de erro da restauracao antes de voltar sozinha ao inicio.
 constexpr uint32_t kCardErrorShowMs = 3000;
 
-// Layout do blob (rfid_seed_card.h): salt | iv | ciphertext | tag | aleatorio.
+// Layout de cada copia (rfid_seed_card.h): salt | iv | ciphertext | tag.
 constexpr size_t kRfidSaltLen = 16;
 constexpr size_t kRfidIvLen = 16;
 constexpr size_t kRfidPlainLen = 48; // 3 blocos AES, tamanho fixo (sem padding)
 constexpr size_t kRfidTagLen = 32;
 constexpr size_t kRfidUsedLen = kRfidSaltLen + kRfidIvLen + kRfidPlainLen + kRfidTagLen; // 112
+// Duas copias independentes (salt/iv/chaves proprios). A copia A e gravada por
+// ultimo: uma gravacao interrompida sempre deixa o backup antigo (A intacto) ou
+// o novo (B completo) legivel. Offsets alinhados a bloco de 16 bytes.
+constexpr int kRfidSlotCount = 2;
+constexpr size_t kRfidSlotOffsets[kRfidSlotCount] = {0, 384};
 
 // MIFARE Classic 1K: 16 setores x 4 blocos de 16 bytes. Bloco 0 (fabricante)
 // e o bloco 3 de cada setor (trailer) nunca sao escritos. Em cartoes 4K so os
@@ -105,8 +113,24 @@ constexpr int kMifareBlockSize = 16;
 constexpr int kMifareSectors = 16;
 constexpr int kMifareUsableBlocks = 47;
 constexpr size_t kMifareUsableBytes = kMifareUsableBlocks * kMifareBlockSize; // 752
-constexpr uint8_t kMifareDefaultKeyA[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// Chaves tentadas, em ordem. A de fabrica e a usual; 00..00 aparece em copias
+// feitas por ferramentas que gravam o trailer como o dump mostra (Key A nao e
+// legivel e sai zerada). Os trailers nunca sao escritos pelo firmware.
+struct MifareKeyOption {
+  bool key_b;
+  uint8_t key[6];
+};
+constexpr MifareKeyOption kMifareKeys[] = {
+    {false, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
+    {false, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+    {true, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
+};
+constexpr int kMifareKeyCount = sizeof(kMifareKeys) / sizeof(kMifareKeys[0]);
 
-static_assert(kRfidUsedLen <= kMifareUsableBytes, "blob nao cabe no cartao");
+static_assert(kRfidSlotOffsets[0] == 0, "copia A no inicio (gravada por ultimo)");
+static_assert(kRfidSlotOffsets[0] + kRfidUsedLen <= kRfidSlotOffsets[1], "copias sobrepostas");
+static_assert(kRfidSlotOffsets[1] % kMifareBlockSize == 0, "copia B fora do alinhamento");
+static_assert(kRfidSlotOffsets[1] + kRfidUsedLen <= kMifareUsableBytes, "copia B nao cabe");
+static_assert(kRfidUsedLen % kMifareBlockSize == 0, "copia nao ocupa blocos inteiros");
 
 } // namespace btcseed
