@@ -336,10 +336,27 @@ async function atualizarUtxos() {
 
     statusEl.textContent = 'Atualizado com sucesso.';
     statusEl.className = 'status ok';
+    return true;
   } catch (erro) {
     statusEl.textContent = 'Erro ao buscar UTXOs: ' + erro.message;
     statusEl.className = 'status erro';
+    return false;
   }
+}
+
+// {spent, txid} da API: se a saida ja foi gasta (confirmada ou na mempool) e por quem.
+async function consultarGasto(txid, vout) {
+  const resp = await fetch(`${API_BASE}/tx/${txid}/outspend/${vout}`);
+  if (!resp.ok) throw new Error(`outspend ${txid.slice(0, 16)}...:${vout}: HTTP ${resp.status}`);
+  return resp.json();
+}
+
+function txidDaEntrada(entrada) {
+  return Array.from(entrada.hash).reverse().map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function linkTx(txid) {
+  return `<a href="https://mempool.space/testnet4/tx/${txid}" target="_blank">${txid.slice(0, 16)}...</a>`;
 }
 
 // Tx que criou o UTXO: o Cardputer exige (PSBT_IN_NON_WITNESS_UTXO) para provar o valor do input.
@@ -361,8 +378,16 @@ async function criarPsbt() {
     statusEl.className = 'status erro';
     return;
   }
+  // A lista antiga pode ter UTXOs ja gastos (causa do erro bad-txns-inputs-missingorspent).
+  statusEl.textContent = 'Atualizando UTXOs...';
+  statusEl.className = 'status';
+  if (!(await atualizarUtxos())) {
+    statusEl.textContent = 'Nao foi possivel atualizar os UTXOs; PSBT nao criado.';
+    statusEl.className = 'status erro';
+    return;
+  }
   if (utxosCarregados.length === 0) {
-    statusEl.textContent = 'Nenhum UTXO carregado. Clique em "Atualizar saldo e UTXOs" primeiro.';
+    statusEl.textContent = 'Nenhum UTXO disponivel neste endereco.';
     statusEl.className = 'status erro';
     return;
   }
@@ -374,6 +399,7 @@ async function criarPsbt() {
     let totalEntrada = 0;
     const necessario = valorSats + feeSats;
     for (const utxo of utxosCarregados) {
+      if ((await consultarGasto(utxo.txid, utxo.vout)).spent) continue; // gasto na mempool
       psbt.addInput({
         hash: utxo.txid,
         index: utxo.vout,
@@ -460,7 +486,28 @@ async function finalizarETransmitir() {
   try {
     const psbt = bitcoin.Psbt.fromBase64(base64, { network: REDE });
     psbt.finalizeAllInputs();
-    const txHex = psbt.extractTransaction().toHex();
+    const tx = psbt.extractTransaction();
+    const txHex = tx.toHex();
+    const txid = tx.getId();
+
+    statusEl.textContent = 'Conferindo as entradas...';
+    statusEl.className = 'status';
+    const existente = await fetch(`${API_BASE}/tx/${txid}`);
+    if (existente.ok) {
+      statusEl.innerHTML = `Essa transacao ja foi transmitida: ${linkTx(txid)}`;
+      statusEl.className = 'status ok';
+      return;
+    }
+    for (const entrada of psbt.txInputs) {
+      const entradaTxid = txidDaEntrada(entrada);
+      const gasto = await consultarGasto(entradaTxid, entrada.index);
+      if (gasto.spent) {
+        statusEl.innerHTML = `Nao transmitido: a entrada ${entradaTxid.slice(0, 16)}...:${entrada.index} ` +
+          `ja foi gasta pela transacao ${linkTx(gasto.txid)}. Atualize os UTXOs e gere um PSBT novo.`;
+        statusEl.className = 'status erro';
+        return;
+      }
+    }
 
     statusEl.textContent = 'Transmitindo para a rede testnet4...';
     statusEl.className = 'status';
@@ -472,6 +519,7 @@ async function finalizarETransmitir() {
 
     statusEl.innerHTML = `Transação transmitida! Txid: <a href="https://mempool.space/testnet4/tx/${texto}" target="_blank">${texto}</a>`;
     statusEl.className = 'status ok';
+    if (carteira) atualizarUtxos(); // o UTXO gasto sai da lista para o proximo PSBT
   } catch (erro) {
     statusEl.textContent = 'Erro ao finalizar/transmitir: ' + erro.message;
     statusEl.className = 'status erro';

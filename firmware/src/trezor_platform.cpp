@@ -1,7 +1,6 @@
 // Pontos de integracao que o trezor-crypto espera da plataforma hospedeira.
-// Nenhuma logica criptografica mora aqui — apenas dois ganchos que a lib
-// declara mas nao implementa, porque sao inerentemente especificos da
-// plataforma:
+// Nenhuma logica criptografica mora aqui — apenas ganchos que a lib declara
+// mas nao implementa, porque sao inerentemente especificos da plataforma:
 //
 //  - tc_fault_handler(): chamado por consteq() quando uma comparacao em
 //    tempo constante detecta uma anomalia (possivel fault injection). A
@@ -10,12 +9,17 @@
 //  - random_buffer(): fonte de entropia usada pelo trezor-crypto para
 //    mascaramento contra side-channel durante a assinatura ECDSA (RFC6979 ja
 //    torna o nonce deterministico; isso e so blinding adicional). NAO e a
-//    origem da seed do usuario (essa vem do teclado).
+//    origem da seed do usuario (essa vem do teclado). Com WiFi/BT desligados,
+//    esp_random() e so pseudoaleatorio: qualquer uso que exija entropia real
+//    (salt/IV) deve chamar strong_random_buffer().
 #include <cstdint>
 #include <cstdlib>
 
+#include "strong_random.h"
+
 #if defined(ARDUINO) || defined(ESP_PLATFORM)
-#include <esp_system.h> // esp_random() — RNG de hardware, sem WiFi/BT
+#include <bootloader_random.h> // fonte de ruido do SAR ADC (entropia real sem RF)
+#include <esp_system.h>        // esp_random()
 #else
 #include <cstddef>
 #include <sys/random.h> // getrandom() — apenas para os testes no host
@@ -46,6 +50,16 @@ void random_buffer(uint8_t *buf, size_t len) {
     }
     offset += static_cast<size_t>(n);
   }
+#endif
+}
+
+void strong_random_buffer(uint8_t *buf, size_t len) {
+#if defined(ARDUINO) || defined(ESP_PLATFORM)
+  bootloader_random_enable();
+  random_buffer(buf, len);
+  bootloader_random_disable();
+#else
+  random_buffer(buf, len);
 #endif
 }
 

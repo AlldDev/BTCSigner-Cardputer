@@ -17,6 +17,7 @@ using btcseed::derive_address;
 using btcseed::derive_master_key;
 using btcseed::MasterKey;
 using btcseed::Network;
+using btcseed::same_account;
 using btcseed::serialize_account_xpub;
 using btcseed::wipe;
 
@@ -96,6 +97,29 @@ static void test_descriptor_for_bip84_vector(void) {
   wipe(&mk);
 }
 
+// TOOLS > Testar backup: so a mesma seed + passphrase + rede conferem.
+static void test_same_account(void) {
+  MasterKey a, b;
+  TEST_ASSERT_TRUE(derive_master_key(kMnemonic, "senha", Network::kTestnet, &a));
+  TEST_ASSERT_TRUE(derive_master_key(kMnemonic, "senha", Network::kTestnet, &b));
+  TEST_ASSERT_TRUE(same_account(a, b));
+
+  TEST_ASSERT_TRUE(derive_master_key(kMnemonic, "senhA", Network::kTestnet, &b));
+  TEST_ASSERT_FALSE(same_account(a, b)); // outra passphrase
+  TEST_ASSERT_TRUE(derive_master_key(kMnemonic, "senha", Network::kMainnet, &b));
+  TEST_ASSERT_FALSE(same_account(a, b)); // outra rede
+  TEST_ASSERT_TRUE(derive_master_key(
+      "legal winner thank year wave sausage worth useful legal winner thank yellow", "senha",
+      Network::kTestnet, &b));
+  TEST_ASSERT_FALSE(same_account(a, b)); // outra seed
+
+  TEST_ASSERT_TRUE(derive_master_key(kMnemonic, "senha", Network::kTestnet, &b));
+  wipe(&b);
+  TEST_ASSERT_FALSE(same_account(a, b)); // invalida
+  TEST_ASSERT_FALSE(same_account(b, b));
+  wipe(&a);
+}
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
@@ -104,5 +128,6 @@ int main(int argc, char **argv) {
   RUN_TEST(test_receive_and_change_addresses_match_bip84_vector);
   RUN_TEST(test_descriptor_checksum_matches_bip380_vector);
   RUN_TEST(test_descriptor_for_bip84_vector);
+  RUN_TEST(test_same_account);
   return UNITY_END();
 }

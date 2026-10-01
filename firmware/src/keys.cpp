@@ -5,6 +5,7 @@
 
 extern "C" {
 #include "bip39.h"
+#include "consteq.h"
 #include "curves.h"
 #include "ecdsa.h"
 #include "memzero.h"
@@ -217,6 +218,19 @@ void wipe_node(HDNode *node) {
   if (node != nullptr) {
     memzero(node, sizeof(HDNode));
   }
+}
+
+bool same_account(const MasterKey &a, const MasterKey &b) {
+  if (!a.valid || !b.valid || a.network != b.network ||
+      a.master_fingerprint != b.master_fingerprint) {
+    return false;
+  }
+  // consteq() sem curto-circuito; & para nao revelar qual das duas diferiu.
+  bool key_eq = consteq(a.account_node.private_key, b.account_node.private_key,
+                        sizeof(a.account_node.private_key));
+  bool chain_eq = consteq(a.account_node.chain_code, b.account_node.chain_code,
+                          sizeof(a.account_node.chain_code));
+  return key_eq & chain_eq;
 }
 
 void wipe(MasterKey *mk) {

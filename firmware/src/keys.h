@@ -59,6 +59,12 @@ bool descriptor_checksum(const char *desc, char out[9]);
 // (nao zpub/vpub, que descriptors nao aceitam).
 bool build_descriptor(const MasterKey &mk, uint32_t change, char *out, size_t out_len);
 
+// true se as duas chaves sao a mesma conta: mesma rede, mesmo fingerprint e
+// mesma chave privada/chain code em m/84'/coin'/0' (comparacao em tempo
+// constante). Usado por TOOLS > Testar backup para conferir um backup contra a
+// sessao sem guardar o mnemonico. Falso se alguma for invalida.
+bool same_account(const MasterKey &a, const MasterKey &b);
+
 // Zera todo material privado das estruturas (private_key, chain_code,
 // private_key_extension, fingerprint). Seguro para chamar mais de uma vez.
 void wipe_node(HDNode *node);
