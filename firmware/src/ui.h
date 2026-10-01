@@ -2,7 +2,7 @@
 // nenhuma logica de fluxo/estado das telas mora aqui (isso e main.cpp).
 //
 // So compila no ambiente `cardputer` (depende de M5Cardputer/M5GFX). O visual
-// (paleta, header/rodape, abas, linhas de lista, caixa de entrada, barras,
+// (paleta, header/rodape, carrossel, linhas de lista, caixa de entrada, barras,
 // icones) segue o design "Bitcoin Signer IoT Interface" do claude.ai/design
 // (Cardputer PSBT Signer.dc.html / Screen.dc.html), 240x135 px.
 //
@@ -62,6 +62,7 @@ constexpr uint16_t kTabIdle = 0x6B4E;    // #6A6A70
 constexpr uint16_t kOk = 0x3EF0;         // #3DDC84
 constexpr uint16_t kError = 0xFA69;      // #FF4D4D
 constexpr uint16_t kOnOrangeDim = 0x4940; // #4A2A05, texto secundario sobre laranja
+constexpr uint16_t kDotIdle = 0x39C8;    // #3A3A40, pontinhos do carrossel
 } // namespace color
 
 enum class Font {
@@ -72,13 +73,13 @@ enum class Font {
 };
 enum class Align { kLeft, kCenter, kRight };
 enum class HeaderNet { kNone, kMainnet, kTestnet };
+enum class MenuIcon { kSign, kWallet, kTools, kSession };
 
 // Geometria fixa: header 0..14, corpo kBodyTop..kBodyBottom, rodape abaixo.
 constexpr int kScreenW = 240;
 constexpr int kScreenH = 135;
 constexpr int kBodyTop = 15;
 constexpr int kBodyBottom = 122;
-constexpr int kTabsH = 15;
 constexpr int kMargin = 4; // margem lateral do conteudo em kBody (29 chars/linha)
 
 // --- ciclo de vida / teclado ---
@@ -129,8 +130,12 @@ int ui_text_wrapped(int x, int y, int w, const char *text, uint16_t c,
 void ui_row(int y, int h, const char *left, const char *right, bool selected,
             uint16_t right_color = color::kMuted);
 
-// Barra de abas de kTabsH px, com sublinhado laranja na aba ativa.
-void ui_tabs(int y, const char *const *labels, int n, int active);
+// Carrossel infinito do menu inicial, no corpo da tela: fila de icones (o
+// selecionado grande e laranja), setas, nome da area e pontinhos. Se `from`
+// e vizinho de `active` (dando a volta), desliza de `from` ate `active`
+// (bloqueia ~180 ms); senao desenha direto. Nao limpa header/rodape.
+void ui_menu_carousel(const MenuIcon *icons, const char *const *labels, int n, int active,
+                      int from);
 
 // Caixa de entrada de 24 px com cursor em bloco. Se `text` nao cabe, mostra
 // o final. Borda vermelha se `error`.

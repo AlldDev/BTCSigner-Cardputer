@@ -14,6 +14,9 @@ constexpr uint32_t kSessionTimeoutMs = 3 * 60 * 1000; // 3 minutos
 // Quanto tempo Enter precisa ficar segurado para assinar uma PSBT.
 constexpr uint32_t kHoldToSignMs = 1500;
 
+// Duracao total do splash de boot (logo + barra), incluindo o sd_init().
+constexpr uint32_t kBootSplashMs = 5000;
+
 // --- Mnemonico ---
 constexpr int kMnemonicWordsShort = 12;
 constexpr int kMnemonicWordsLong = 24;
@@ -75,7 +78,7 @@ constexpr const char *kPsbtExtension = ".psbt";
 constexpr const char *kSignedSuffix = "_signed";
 constexpr const char *kXpubExportFile = "/wallet_export.txt";
 constexpr int kMaxPsbtFilesListed = 32; // quantos .psbt cabem no menu
-// Sem cartao montado, a aba ASSINAR tenta montar de novo a cada kSdPollMs.
+// Sem cartao montado, a lista ASSINAR tenta montar de novo a cada kSdPollMs.
 constexpr uint32_t kSdPollMs = 2000;
 
 // --- Backup opcional cifrado da seed em cartao MIFARE Classic (Unit RFID2) ---

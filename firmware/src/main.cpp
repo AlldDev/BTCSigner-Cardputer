@@ -51,7 +51,8 @@ enum class State {
   kBackupResult,
   kRestorePassword, // senha do cartao lido em "Restaurar do cartao"
   kCardError,       // erro na restauracao: tela cheia, volta sozinha ao inicio
-  kMainMenu, // abas ASSINAR / CARTEIRA / SESSAO / TOOLS
+  kHome,     // carrossel de areas ASSINAR / CARTEIRA / TOOLS / SESSAO
+  kMainMenu, // lista da area g_tab
   kPsbtReviewOutput,
   kPsbtReviewFee,
   kPsbtConfirm, // segurar Enter para assinar
@@ -82,7 +83,7 @@ Session g_session(millis_fn);
 
 State g_state = State::kSelectWordCount;
 bool g_sd_ok = false;
-uint32_t g_sd_last_poll_ms = 0; // deteccao de cartao inserido na aba ASSINAR
+uint32_t g_sd_last_poll_ms = 0; // deteccao de cartao inserido na lista ASSINAR
 
 int g_word_count_choice = kMnemonicWordsLong;
 Network g_network_choice = Network::kMainnet;
@@ -108,9 +109,11 @@ bool g_backup_skip_armed = false; // falha: primeiro ESC so avisa, o segundo pul
 char g_backup_msg[32] = {0};
 uint32_t g_kdf_ms = 0; // exibido no sucesso, para calibrar kRfidPbkdf2Iterations
 
-// Menu principal em abas.
-enum Tab { kTabSign = 0, kTabWallet, kTabSession, kTabTools, kTabCount };
-constexpr const char *kTabLabels[kTabCount] = {"ASSINAR", "CARTEIRA", "SESSAO", "TOOLS"};
+// Menu principal: carrossel de areas (kHome) -> lista da area (kMainMenu).
+enum Tab { kTabSign = 0, kTabWallet, kTabTools, kTabSession, kTabCount };
+constexpr const char *kTabLabels[kTabCount] = {"ASSINAR", "CARTEIRA", "TOOLS", "SESSAO"};
+constexpr MenuIcon kTabIcons[kTabCount] = {MenuIcon::kSign, MenuIcon::kWallet, MenuIcon::kTools,
+                                           MenuIcon::kSession};
 enum WalletRow { kRowFingerprint = 0, kRowNetwork, kRowScript, kRowXpub, kRowReceive,
                  kWalletRowCount };
 enum SessionRow { kRowAutoLock = 0, kRowEndSession, kSessionRowCount };
@@ -118,8 +121,9 @@ enum ToolsRow { kRowTestBackup = 0, kRowEraseBackup, kRowBrightness, kToolsRowCo
 enum VerifySourceRow { kVerify12 = 0, kVerify24, kVerifyCard, kVerifySourceCount };
 enum XpubChoiceRow { kXpubChoiceRaw = 0, kXpubChoiceDownload, kXpubChoiceCount };
 constexpr int kMenuRowH = 20;
-constexpr int kMenuVisibleRows = 4;
+constexpr int kMenuVisibleRows = 5;
 int g_tab = kTabSign;
+int g_home_from = kTabSign; // area mostrada antes da tecla: o carrossel desliza dela ate g_tab
 int g_row = 0;
 
 constexpr uint8_t kBrightnessLevels[] = {77, 128, 179, 255};
@@ -267,6 +271,12 @@ void go_to_menu(int tab) {
   g_state = State::kMainMenu;
 }
 
+void go_to_home(int tab) {
+  g_tab = tab;
+  g_home_from = tab;
+  g_state = State::kHome;
+}
+
 // Sai de TOOLS > Testar backup no meio: zera o que foi digitado/lido, mas a
 // sessao continua.
 void abort_verify() {
@@ -345,19 +355,19 @@ void render_checksum_failed() {
 
 void render_passphrase_entry() {
   ui_begin_screen("PASSPHRASE", "ESC sair  DEL apagar", "OK continuar");
-  ui_text(kMargin, 24, g_verify_mode ? "PASSPHRASE DESTA SESSAO" : "PASSPHRASE (25a PALAVRA)",
-          color::kMuted);
+  ui_text(kMargin, 19, g_verify_mode ? "PASSPHRASE DESTA SESSAO" : "PASSPHRASE (25a PALAVRA)",
+          color::kMuted, Font::kBody);
   char display[kMaxPassphraseLen + 1];
   g_passphrase.render_display(display, sizeof(display));
   bool failed = g_status_line[0] != '\0';
-  ui_input_box(kMargin, 36, kContentW, display, failed);
+  ui_input_box(kMargin, 37, kContentW, display, failed);
   memzero(display, sizeof(display)); // com Tab, e a passphrase em claro
   if (failed) {
-    ui_text(kMargin, 66, g_status_line, color::kError);
+    ui_text(kMargin, 67, g_status_line, color::kError);
   } else {
-    ui_text(kMargin, 66, "Pode ficar vazia. Tab mostra/oculta.", color::kMuted);
+    ui_text(kMargin, 67, "Pode ficar vazia. Tab mostra/oculta.", color::kMuted);
   }
-  ui_text(kMargin, 78, "Fn+` digita o caractere `", color::kMuted);
+  ui_text(kMargin, 79, "Fn+` digita o caractere `", color::kMuted);
 }
 
 void render_fingerprint_confirm() {
@@ -405,14 +415,14 @@ void render_backup_offer() {
 void render_card_password(const char *title, const char *label, const PassphraseInput &pw,
                           const char *hint) {
   ui_begin_screen(title, "ESC voltar  DEL apagar", "OK continuar");
-  ui_text(kMargin, 20, label, color::kMuted);
+  ui_text(kMargin, 19, label, color::kMuted, Font::kBody);
   char display[kMaxPassphraseLen + 1];
   pw.render_display(display, sizeof(display));
   bool failed = g_status_line[0] != '\0';
-  ui_input_box(kMargin, 30, kContentW, display, failed);
+  ui_input_box(kMargin, 37, kContentW, display, failed);
   memzero(display, sizeof(display));
-  ui_text(kMargin, 60, failed ? g_status_line : hint, failed ? color::kError : color::kMuted);
-  ui_text(kMargin, 72, "Tab mostra/oculta", color::kMuted);
+  ui_text(kMargin, 67, failed ? g_status_line : hint, failed ? color::kError : color::kMuted);
+  ui_text(kMargin, 79, "Tab mostra/oculta", color::kMuted);
 }
 
 void render_backup_overwrite_confirm() {
@@ -468,19 +478,27 @@ void render_menu_rows(int y0, const MenuRow *rows, int n) {
   }
 }
 
+// Carrossel de areas. Numa troca de area (,/) so o corpo e redesenhado e a
+// faixa de icones desliza; header e rodape ja estao na tela.
+void render_home() {
+  if (g_home_from == g_tab) ui_begin_screen("SIGNER", "<> navegar", "OK abrir");
+  ui_menu_carousel(kTabIcons, kTabLabels, kTabCount, g_tab, g_home_from);
+  g_home_from = g_tab;
+}
+
 void render_main_menu() {
-  const char *hint = g_tab == kTabSign ? "<> abas ^v R atualiza" : "<> abas  ^v mover";
-  ui_begin_screen("SIGNER", g_status_line[0] != '\0' ? g_status_line : hint, "OK abrir");
-  ui_tabs(kBodyTop, kTabLabels, kTabCount, g_tab);
-  int y0 = kBodyTop + kTabsH + 1;
+  const char *hint = g_tab == kTabSign ? "ESC menu ^v R atualiza" : "ESC menu  ^v mover";
+  ui_begin_screen(kTabLabels[g_tab], g_status_line[0] != '\0' ? g_status_line : hint,
+                  "OK abrir");
+  int y0 = kBodyTop + 3;
 
   if (g_tab == kTabSign) {
     if (g_psbt_file_count == 0) {
-      ui_text(kScreenW / 2, 52, "nenhum .psbt no cartao", color::kMuted, Font::kBody,
+      ui_text(kScreenW / 2, 42, "nenhum .psbt no cartao", color::kMuted, Font::kBody,
               Align::kCenter);
-      ui_text(kScreenW / 2, 74, g_sd_ok ? "coloque em /psbt ou na raiz" : "cartao SD nao montado",
+      ui_text(kScreenW / 2, 64, g_sd_ok ? "coloque em /psbt ou na raiz" : "cartao SD nao montado",
               g_sd_ok ? color::kMuted : color::kError, Font::kSmall, Align::kCenter);
-      ui_text(kScreenW / 2, 86, g_sd_ok ? "R atualiza a lista" : "insira o cartao: detecta sozinho",
+      ui_text(kScreenW / 2, 76, g_sd_ok ? "R atualiza a lista" : "insira o cartao: detecta sozinho",
               color::kMuted, Font::kSmall, Align::kCenter);
       return;
     }
@@ -737,6 +755,7 @@ void render() {
       render_card_password("RESTAURAR", "SENHA DO CARTAO", g_card_pw,
                            "A passphrase e pedida depois");
       break;
+    case State::kHome: render_home(); break;
     case State::kMainMenu: render_main_menu(); break;
     case State::kPsbtReviewOutput: render_psbt_review_output(); break;
     case State::kPsbtReviewFee: render_psbt_review_fee(); break;
@@ -800,7 +819,7 @@ void confirm_fingerprint_and_start_session() {
   g_session.start(&g_pending_mk); // move: g_pending_mk fica vazio depois
   wipe_seed_material();           // mnemonico e passphrase nao sao mais
                                   // necessarios: a MasterKey ja esta na sessao
-  go_to_menu(kTabSign);
+  go_to_home(kTabSign);
 }
 
 // --- backup/restauracao no cartao RFID ----------------------------------------
@@ -1414,10 +1433,19 @@ void handle_key(const KeyEvent &key) {
       }
       break;
 
+    case State::kHome:
+      if (key.ch == kKeyLeft || key.ch == kKeyRight) {
+        g_home_from = g_tab;
+        g_tab = (g_tab + (key.ch == kKeyRight ? 1 : kTabCount - 1)) % kTabCount;
+      } else if (key.enter) {
+        go_to_menu(g_tab);
+      }
+      break;
+
     case State::kMainMenu: {
       int n = menu_row_count();
-      if (key.ch == kKeyLeft || key.ch == kKeyRight) {
-        go_to_menu((g_tab + (key.ch == kKeyRight ? 1 : kTabCount - 1)) % kTabCount);
+      if (key.esc) {
+        go_to_home(g_tab);
       } else if (key.ch == kKeyUp && n > 0) {
         g_row = (g_row + n - 1) % n;
       } else if (key.ch == kKeyDown && n > 0) {
@@ -1551,12 +1579,15 @@ void setup() {
   ui_text(kScreenW / 2, 66, "BTC SIGNER", color::kText, Font::kTitle, Align::kCenter);
   ui_text(kScreenW / 2, 86, "PSBT - OFFLINE - AIR-GAPPED", color::kMuted, Font::kSmall,
           Align::kCenter);
-  render_boot(10);
+  // O splash dura kBootSplashMs no total, contando o tempo do sd_init().
+  uint32_t t0 = millis();
+  render_boot(0);
   g_sd_ok = sd_init(); // se falhar, so as operacoes de PSBT/export falharao depois
-  for (int pct = 20; pct <= 100; pct += 10) {
-    render_boot(pct);
-    delay(60);
+  for (uint32_t el = millis() - t0; el < kBootSplashMs; el = millis() - t0) {
+    render_boot(static_cast<int>(el * 100 / kBootSplashMs));
+    delay(40);
   }
+  render_boot(100);
   render();
 }
 

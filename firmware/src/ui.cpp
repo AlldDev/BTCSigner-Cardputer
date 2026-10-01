@@ -1,6 +1,7 @@
 // So compila no ambiente `cardputer`. Ver ui.h para a origem do visual.
 #include "ui.h"
 
+#include <cmath>
 #include <cstring>
 
 #include <M5Cardputer.h>
@@ -77,6 +78,105 @@ void draw_footer(const char *left, const char *right) {
     ui_text(kScreenW - 5, kFooterY + 3, right, color::kOrange, Font::kSmall,
             Align::kRight);
   }
+}
+
+// --- carrossel do menu inicial (geometria do design, deslocada pelo header) ---
+constexpr int kStripY = 21;   // faixa dos icones (desenhada num sprite)
+constexpr int kStripH = 62;
+constexpr int kTileW = 64;    // passo entre icones
+constexpr int kCarouselLabelY = 88;
+constexpr int kCarouselDotsY = 107;
+constexpr uint32_t kSlideMs = 180;
+
+// Icones do design (viewBox 24x24, traco 1.8), em escala `s` px centrada em
+// (cx, cy). So primitivas do M5GFX: nao ha SVG no firmware.
+struct IconPen {
+  lgfx::LovyanGFX &g;
+  float x0, y0, k, r;
+  uint16_t c;
+  float X(float x) const { return x0 + x * k; }
+  float Y(float y) const { return y0 + y * k; }
+  void line(float ax, float ay, float bx, float by) const {
+    g.drawWideLine(X(ax), Y(ay), X(bx), Y(by), r, c);
+  }
+  void round_rect(float ax, float ay, float bx, float by, float rad) const {
+    int x = static_cast<int>(X(ax) + 0.5f), y = static_cast<int>(Y(ay) + 0.5f);
+    int w = static_cast<int>((bx - ax) * k + 0.5f), h = static_cast<int>((by - ay) * k + 0.5f);
+    int rr = static_cast<int>(rad * k + 0.5f);
+    g.drawRoundRect(x, y, w, h, rr, c);
+    if (r >= 0.8f) g.drawRoundRect(x + 1, y + 1, w - 2, h - 2, rr > 0 ? rr - 1 : 0, c);
+  }
+};
+
+void draw_menu_icon(lgfx::LovyanGFX &g, MenuIcon icon, int cx, int cy, int s, uint16_t c) {
+  float k = s / 24.0f;
+  IconPen p{g, cx - 12 * k, cy - 12 * k, k, 0.9f * k, c};
+  switch (icon) {
+    case MenuIcon::kSign: // lapis
+      p.line(4, 20, 8, 20);
+      p.line(8, 20, 19, 9);
+      p.line(19, 9, 15, 5);
+      p.line(15, 5, 4, 16);
+      p.line(4, 16, 4, 20);
+      p.line(13.5f, 6.5f, 17.5f, 10.5f);
+      p.line(14, 20, 20, 20);
+      break;
+    case MenuIcon::kWallet: // carteira
+      p.round_rect(3, 7, 20, 20, 2);
+      p.line(3, 7, 15, 4);
+      p.line(15, 4, 15, 7);
+      p.line(16, 13.5f, 17, 13.5f);
+      break;
+    case MenuIcon::kTools: // engrenagem
+      g.drawCircle(cx, cy, static_cast<int>(3 * k + 0.5f), c);
+      g.drawCircle(cx, cy, static_cast<int>(3 * k + 0.5f) - 1, c);
+      p.line(12, 2, 12, 5);
+      p.line(12, 19, 12, 22);
+      p.line(2, 12, 5, 12);
+      p.line(19, 12, 22, 12);
+      p.line(4.9f, 4.9f, 7, 7);
+      p.line(17, 17, 19.1f, 19.1f);
+      p.line(4.9f, 19.1f, 7, 17);
+      p.line(17, 7, 19.1f, 4.9f);
+      break;
+    case MenuIcon::kSession: // cadeado
+      p.round_rect(5, 11, 19, 21, 2);
+      p.line(8, 11, 8, 7);
+      p.line(16, 11, 16, 7);
+      g.fillArc(static_cast<int>(p.X(12) + 0.5f), static_cast<int>(p.Y(7) + 0.5f),
+                static_cast<int>(4 * k + p.r), static_cast<int>(4 * k - p.r), 180, 360, c);
+      p.line(12, 15, 12, 17);
+      break;
+  }
+}
+
+// Faixa de icones em `g` (sprite ou a propria tela) com topo em `y0`. `center`
+// fica no meio deslocado de `offset` px; os vizinhos se repetem dando a volta,
+// entao o ultimo -> primeiro desliza como qualquer outro passo. Tamanho e cor
+// de cada tile dependem da distancia ao meio, o que anima a troca de destaque.
+void draw_strip(lgfx::LovyanGFX &g, int y0, const MenuIcon *icons, int n, int center,
+                float offset) {
+  g.fillRect(0, y0, kScreenW, kStripH, color::kBg);
+  int cy = y0 + kStripH / 2;
+  for (int rel = -3; rel <= 3; rel++) {
+    float fx = kScreenW / 2 + rel * kTileW + offset;
+    float d = fabsf(fx - kScreenW / 2) / kTileW;
+    if (d > 1.0f) d = 1.0f;
+    int size = static_cast<int>(54 - 14 * d + 0.5f);
+    int icon = static_cast<int>(26 - 8 * d + 0.5f);
+    bool on = d < 0.5f;
+    int x = static_cast<int>(fx + 0.5f) - size / 2;
+    if (x + size < 0 || x >= kScreenW) continue;
+    int idx = ((center + rel) % n + n) % n;
+    g.fillRoundRect(x, cy - size / 2, size, size, 10, on ? color::kOrange : color::kSurface);
+    if (!on) g.drawRoundRect(x, cy - size / 2, size, size, 10, color::kLine);
+    draw_menu_icon(g, icons[idx], x + size / 2, cy, icon, on ? color::kBg : color::kMuted);
+  }
+  // Setas: carrossel infinito, sempre ha vizinho dos dois lados.
+  g.drawWideLine(8, cy - 4, 5, cy, 1.0f, color::kOrange);
+  g.drawWideLine(5, cy, 8, cy + 4, 1.0f, color::kOrange);
+  g.drawWideLine(kScreenW - 9, cy - 4, kScreenW - 6, cy, 1.0f, color::kOrange);
+  g.drawWideLine(kScreenW - 6, cy, kScreenW - 9, cy + 4, 1.0f, color::kOrange);
 }
 
 } // namespace
@@ -180,17 +280,51 @@ void ui_row(int y, int h, const char *left, const char *right, bool selected,
   }
 }
 
-void ui_tabs(int y, const char *const *labels, int n, int active) {
+void ui_menu_carousel(const MenuIcon *icons, const char *const *labels, int n, int active,
+                      int from) {
   if (n <= 0) return;
-  int w = kScreenW / n;
-  D().fillRect(0, y, kScreenW, kTabsH, color::kBg);
+  D().fillRect(0, kCarouselLabelY, kScreenW, kFooterY - kCarouselLabelY, color::kBg);
+  ui_text(kScreenW / 2, kCarouselLabelY, labels[active], color::kText, Font::kTitle,
+          Align::kCenter);
+  int dots_w = 10 + (n - 1) * (3 + 3);
+  int x = (kScreenW - dots_w) / 2;
   for (int i = 0; i < n; i++) {
-    bool on = i == active;
-    ui_text(i * w + w / 2, y + 4, labels[i], on ? color::kOrange : color::kTabIdle,
-            Font::kSmall, Align::kCenter);
-    if (on) D().fillRect(i * w, y + kTabsH - 3, w, 2, color::kOrange);
+    int w = i == active ? 10 : 3;
+    D().fillRoundRect(x, kCarouselDotsY, w, 3, 1, i == active ? color::kOrange : color::kDotIdle);
+    x += w + 3;
   }
-  D().drawFastHLine(0, y + kTabsH - 1, kScreenW, color::kLine);
+
+  int dir = 0;
+  if (from != active) {
+    if ((from + 1) % n == active) dir = 1;
+    else if ((from + n - 1) % n == active) dir = -1;
+  }
+  M5Canvas canvas(&D());
+  canvas.setColorDepth(16);
+  bool sprite = canvas.createSprite(kScreenW, kStripH) != nullptr;
+  if (dir == 0) {
+    if (sprite) {
+      draw_strip(canvas, 0, icons, n, active, 0.0f);
+      canvas.pushSprite(0, kStripY);
+    } else {
+      draw_strip(D(), kStripY, icons, n, active, 0.0f);
+    }
+  } else if (!sprite) {
+    // Sem heap para o sprite: sem animacao (desenhar direto piscaria).
+    draw_strip(D(), kStripY, icons, n, active, 0.0f);
+  } else {
+    // O deslocamento vai de 0 (centro em `from`) a 1 tile, com ease-out.
+    uint32_t t0 = millis();
+    for (;;) {
+      uint32_t el = millis() - t0;
+      float p = el >= kSlideMs ? 1.0f : static_cast<float>(el) / kSlideMs;
+      float e = 1.0f - (1.0f - p) * (1.0f - p);
+      draw_strip(canvas, 0, icons, n, from, -dir * e * kTileW);
+      canvas.pushSprite(0, kStripY);
+      if (p >= 1.0f) break;
+    }
+  }
+  if (sprite) canvas.deleteSprite();
 }
 
 void ui_input_box(int x, int y, int w, const char *text, bool error) {

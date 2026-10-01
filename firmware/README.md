@@ -23,7 +23,7 @@ Documentação técnica do firmware. Para a visão geral do projeto, ver o
 
 **Validado em testnet num Cardputer real, ainda não usado em mainnet.** O núcleo criptográfico e o
 parser de PSBT estão testados contra vetores oficiais e casos maliciosos no host. O fluxo de telas,
-o teclado e a E/S no microSD rodam no aparelho físico: entrada de seed, aba CARTEIRA, listagem de
+o teclado e a E/S no microSD rodam no aparelho físico: entrada de seed, área CARTEIRA, listagem de
 `.psbt` e assinatura gravando `*_signed.psbt` no cartão, tudo em testnet. O firmware **não deve
 ser usado com fundos reais** antes do primeiro uso em mainnet com valores pequenos (ver
 [O que falta](#o-que-falta)).
@@ -116,11 +116,11 @@ tem a E/S de fato (Arduino `SD.h`/`SPI.h`) e só compila no ambiente `cardputer`
 - **Layout no cartão**: PSBTs em `/psbt/*.psbt` (até 32 listadas), assinadas gravadas como
   `<nome>_signed.psbt`, export em `/wallet_export.txt`.
 - **Troca a quente**: dá para inserir, tirar ou trocar o microSD com o aparelho ligado. Ao entrar na
-  aba ASSINAR (e antes de exportar o xpub), o firmware desmonta e monta o cartão de novo
+  lista ASSINAR (e antes de exportar o xpub), o firmware desmonta e monta o cartão de novo
   (`sd_remount()`), para nunca escrever num cartão trocado com a FAT em cache do anterior. A
-  tecla **R** na aba ASSINAR faz o mesmo na hora. Sem cartão montado, a aba tenta montar a cada
+  tecla **R** na lista ASSINAR faz o mesmo na hora. Sem cartão montado, a lista tenta montar a cada
   2 s (`kSdPollMs`), então um cartão inserido aparece sozinho. Uma remoção só é percebida no
-  próximo R, na próxima entrada na aba ou quando uma leitura/gravação falha.
+  próximo R, na próxima entrada na lista ou quando uma leitura/gravação falha.
 
 ---
 
@@ -130,7 +130,7 @@ Recurso **opt-in**: por padrão nada muda, e a seed continua sendo digitada a ca
 confirmar o fingerprint de uma seed **digitada**, o firmware oferece gravar uma cópia cifrada num
 cartão MIFARE Classic 1K/4K pela **M5Stack Unit RFID2** (chip WS1850S, compatível com o MFRC522).
 Na tela inicial, "Restaurar do cartão" lê essa cópia em vez de pedir as palavras. Durante a sessão,
-a aba **TOOLS** permite conferir o backup (em papel ou no cartão) contra a sessão aberta e apagar o
+a área **TOOLS** permite conferir o backup (em papel ou no cartão) contra a sessão aberta e apagar o
 backup do cartão. A **passphrase
 nunca vai para o cartão**: ela continua sendo digitada depois da restauração, então segue valendo
 como segundo fator.
@@ -255,10 +255,13 @@ convenções cobrem a lacuna (documentadas em `ui.h`):
 + bateria, rodapé com dica/ação, splash de boot e telas de sucesso/erro com ícone. Textos só em
 ASCII (a fonte 6x8 do M5GFX não tem acentos).
 
-- **Menu em abas**: `,` `/` trocam de aba, `;` `.` movem, Enter abre. ASSINAR = lista de `.psbt`
-  do SD; CARTEIRA = fingerprint, rede, script, exportar xpub, endereço de recebimento; SESSAO =
-  bloqueio automático (informativo) e encerrar sessão; TOOLS = testar backup (papel ou cartão,
-  contra a sessão), apagar o backup RFID e brilho (Enter cicla 30/50/70/100%, não persiste).
+- **Menu em carrossel**: depois da seed, um carrossel infinito de ícones (ASSINAR, CARTEIRA, TOOLS,
+  SESSAO): `,` `/` deslizam entre as áreas (do último volta ao primeiro), Enter abre a lista da
+  área e ESC volta ao carrossel. Na lista, `;` `.` movem e Enter abre. ASSINAR = lista de `.psbt`
+  do SD; CARTEIRA = fingerprint, rede, script, exportar xpub, endereço de recebimento; TOOLS =
+  testar backup (papel ou cartão, contra a sessão), apagar o backup RFID e brilho (Enter cicla
+  30/50/70/100%, não persiste); SESSAO = bloqueio automático (informativo) e encerrar sessão. A
+  animação usa um sprite de 240x62 (~30 KB) alocado só durante o deslize; sem heap, troca direto.
 - **Fontes**: conteúdo em `AsciiFont8x16` (29 caracteres/linha com margem de 4 px),
   header/rodapé/rótulos em 6x8. Endereços sempre completos: P2WPKH ocupa 2 linhas, P2WSH/P2TR 3. Se
   não couber, `draw_address` cai para 6x8 em vez de cortar. A quebra (`wrap_next_line`) é testada
