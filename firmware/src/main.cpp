@@ -61,6 +61,7 @@ enum class State {
   kXpubExport,
   kReceiveAddressEntry,
   kReceiveAddressShow,
+  kToolVerifySource, // TOOLS > Testar backup: papel 12/24 ou cartao RFID
   kToolTestPassword, // TOOLS > Testar backup: senha do cartao lido
   kToolEraseConfirm, // TOOLS > Apagar backup: segurar Enter
   kToolResult,
@@ -114,6 +115,7 @@ enum WalletRow { kRowFingerprint = 0, kRowNetwork, kRowScript, kRowXpub, kRowRec
                  kWalletRowCount };
 enum SessionRow { kRowAutoLock = 0, kRowEndSession, kSessionRowCount };
 enum ToolsRow { kRowTestBackup = 0, kRowEraseBackup, kRowBrightness, kToolsRowCount };
+enum VerifySourceRow { kVerify12 = 0, kVerify24, kVerifyCard, kVerifySourceCount };
 enum XpubChoiceRow { kXpubChoiceRaw = 0, kXpubChoiceDownload, kXpubChoiceCount };
 constexpr int kMenuRowH = 20;
 constexpr int kMenuVisibleRows = 4;
@@ -146,6 +148,11 @@ bool g_xpub_write_attempted = false; // true so quando veio de "Baixar arquivo"
 char g_error_title[32] = {0};
 char g_error_msg[48] = {0};
 uint32_t g_card_error_since = 0; // kCardError
+
+// TOOLS > Testar backup: com g_verify_mode, as telas de palavras/passphrase
+// (as mesmas da entrada da seed) conferem contra a sessao em vez de abrir uma.
+bool g_verify_mode = false;
+int g_verify_slot = -1; // copia do cartao que abriu; -1 = digitado (papel)
 
 // TOOLS: resultado de Testar/Apagar backup.
 bool g_tool_ok = false;
@@ -229,6 +236,7 @@ void go_to_start(const char *reason) {
   set_status(reason);
   g_start_row = kStartRow24;
   g_restore_mode = false;
+  g_verify_mode = false;
   g_word_count_choice = kMnemonicWordsLong;
   g_network_choice = Network::kMainnet;
   g_state = State::kSelectWordCount;
@@ -257,6 +265,17 @@ void go_to_menu(int tab) {
   g_row = 0;
   if (tab == kTabSign) refresh_psbt_list();
   g_state = State::kMainMenu;
+}
+
+// Sai de TOOLS > Testar backup no meio: zera o que foi digitado/lido, mas a
+// sessao continua.
+void abort_verify() {
+  wipe_seed_material();
+  wipe(&g_pending_mk);
+  rfid_release_card();
+  g_verify_mode = false;
+  g_verify_slot = -1;
+  go_to_menu(kTabTools);
 }
 
 // --- render ------------------------------------------------------------------
@@ -326,7 +345,8 @@ void render_checksum_failed() {
 
 void render_passphrase_entry() {
   ui_begin_screen("PASSPHRASE", "ESC sair  DEL apagar", "OK continuar");
-  ui_text(kMargin, 24, "PASSPHRASE (25a PALAVRA)", color::kMuted);
+  ui_text(kMargin, 24, g_verify_mode ? "PASSPHRASE DESTA SESSAO" : "PASSPHRASE (25a PALAVRA)",
+          color::kMuted);
   char display[kMaxPassphraseLen + 1];
   g_passphrase.render_display(display, sizeof(display));
   bool failed = g_status_line[0] != '\0';
@@ -485,7 +505,7 @@ void render_main_menu() {
     char bright[8];
     snprintf(bright, sizeof(bright), "%d%%", kBrightnessPct[g_brightness_idx]);
     const MenuRow rows[kToolsRowCount] = {
-        {"Testar backup RFID", ">", color::kMuted},
+        {"Testar backup", ">", color::kMuted},
         {"Apagar backup RFID", ">", color::kError},
         {"Brilho", bright, color::kMuted},
     };
@@ -650,6 +670,18 @@ void render_receive_address_show() {
   }
 }
 
+void render_tool_verify_source() {
+  ui_begin_screen("TESTAR BACKUP", "ESC voltar  ^v mover", "OK escolher");
+  ui_text(kMargin, 18, "CONFERIR COM ESTA SESSAO", color::kMuted);
+  const MenuRow rows[kVerifySourceCount] = {
+      {"Papel: 12 palavras", nullptr, color::kMuted},
+      {"Papel: 24 palavras", nullptr, color::kMuted},
+      {"Cartao RFID", nullptr, color::kMuted},
+  };
+  render_menu_rows(28, rows, kVerifySourceCount);
+  ui_text(kMargin, 108, "A passphrase e pedida no fim", color::kMuted);
+}
+
 void render_tool_erase_confirm() {
   ui_begin_screen("APAGAR BACKUP", "ESC cancelar", "segure OK");
   ui_text(kScreenW / 2, 24, "Apagar o backup do cartao?", color::kText, Font::kBody,
@@ -716,9 +748,10 @@ void render() {
     case State::kXpubExport: render_xpub_export(); break;
     case State::kReceiveAddressEntry: render_receive_address_entry(); break;
     case State::kReceiveAddressShow: render_receive_address_show(); break;
+    case State::kToolVerifySource: render_tool_verify_source(); break;
     case State::kToolTestPassword:
       render_card_password("TESTAR BACKUP", "SENHA DO CARTAO", g_card_pw,
-                           "A seed nao aparece na tela");
+                           "Depois: a passphrase desta sessao");
       break;
     case State::kToolEraseConfirm: render_tool_erase_confirm(); break;
     case State::kToolResult: render_tool_result(); break;
@@ -743,9 +776,14 @@ void finish_mnemonic_entry() {
     return;
   }
   if (!g_mnemonic.build_mnemonic(g_mnemonic_text, sizeof(g_mnemonic_text))) {
-    go_to_start("Erro interno ao montar mnemonico");
+    if (g_verify_mode) {
+      abort_verify();
+    } else {
+      go_to_start("Erro interno ao montar mnemonico");
+    }
     return;
   }
+  g_passphrase.wipe();
   g_state = State::kPassphraseEntry;
 }
 
@@ -900,6 +938,8 @@ void show_tool_result(bool ok, const char *title, const char *msg, const char *m
   memzero(g_rfid_card, sizeof(g_rfid_card));
   memzero(g_rfid_scan, sizeof(g_rfid_scan));
   g_card_pw.wipe();
+  g_verify_mode = false;
+  g_verify_slot = -1;
   g_tool_ok = ok;
   copy_str(g_tool_title, sizeof(g_tool_title), title);
   copy_str(g_tool_msg, sizeof(g_tool_msg), msg);
@@ -931,38 +971,71 @@ void start_tool_test() {
   if (!tool_read_card(g_rfid_card)) return;
   rfid_release_card();
   g_card_pw.wipe();
+  g_verify_mode = true;
+  g_verify_slot = -1;
   g_state = State::kToolTestPassword;
 }
 
-// Decifra so para conferir: o mnemonico sai da RAM antes de qualquer desenho.
-// Nao compara com a seed da sessao (mnemonico e passphrase ja foram zerados).
+void start_tool_verify_paper(int words) {
+  wipe_seed_material();
+  g_verify_mode = true;
+  g_verify_slot = -1;
+  g_word_count_choice = words;
+  enter_mnemonic_entry();
+}
+
+// Decifra o cartao; o mnemonico fica em g_mnemonic_text (nunca desenhado) ate
+// a passphrase ser digitada e verify_against_session() conferir e zerar tudo.
 void attempt_tool_test_decode() {
   render_busy("DECIFRANDO", "Derivando chave da senha", "senha errada leva o dobro (2 copias)");
   int slot = -1;
   RfidCardStatus st = rfid_decode_backup(g_card_pw.value(), static_cast<size_t>(g_card_pw.length()),
                                          g_rfid_card, kRfidPbkdf2Iterations, g_mnemonic_text,
                                          sizeof(g_mnemonic_text), &slot);
-  int words = 0;
-  if (st == RfidCardStatus::kOk) {
-    words = 1;
-    for (const char *p = g_mnemonic_text; *p != '\0'; p++) words += *p == ' ';
-  }
-  memzero(g_mnemonic_text, sizeof(g_mnemonic_text));
   g_card_pw.wipe();
   if (st == RfidCardStatus::kAuthFailed) {
     set_status("Senha errada ou cartao danificado"); // cartao continua lido: tentar de novo
     return;
   }
+  memzero(g_rfid_card, sizeof(g_rfid_card));
   if (st != RfidCardStatus::kOk) {
+    g_verify_mode = false;
     show_tool_result(false, "Corrompido", "Conteudo do cartao invalido", "");
     return;
   }
+  g_verify_slot = slot;
+  g_passphrase.wipe();
+  g_state = State::kPassphraseEntry; // g_verify_mode: Enter -> verify_against_session()
+}
+
+// Deriva a chave do backup (papel ou cartao) + passphrase e compara com a da
+// sessao. Tudo, menos a sessao, e zerado antes do resultado aparecer.
+void verify_against_session() {
+  render_busy("CONFERINDO", "Derivando a chave", "comparando com a sessao");
+  bool derived = derive_master_key(g_mnemonic_text, g_passphrase.value(), g_network_choice,
+                                   &g_pending_mk);
+  bool match = derived && same_account(g_pending_mk, g_session.master_key());
+  char fp[10] = {0};
+  if (derived) format_fingerprint_spaced(g_pending_mk.master_fingerprint, fp);
+  int slot = g_verify_slot;
+  wipe(&g_pending_mk);
+  wipe_seed_material();
+  g_verify_mode = false;
+  g_verify_slot = -1;
+
   char msg[40];
-  snprintf(msg, sizeof(msg), "%d palavras, copia %c", words, slot == 0 ? 'A' : 'B');
-  // So a copia B abriu: A danificada (ex.: gravacao interrompida). Regravar.
-  show_tool_result(true, "Backup OK", msg,
-                   slot == 0 ? "confere senha e cartao, nao a sessao"
-                             : "copia A danificada: grave de novo");
+  if (!derived) {
+    show_tool_result(false, "Falha", "Falha ao derivar chave", "");
+  } else if (match) {
+    snprintf(msg, sizeof(msg), "fp %s", fp);
+    const char *source = slot < 0    ? "backup em papel + passphrase"
+                         : slot == 0 ? "cartao (copia A) + passphrase"
+                                     : "copia A danificada: grave de novo";
+    show_tool_result(true, "Confere com a sessao", msg, source);
+  } else {
+    snprintf(msg, sizeof(msg), "fp digitado %s", fp);
+    show_tool_result(false, "NAO confere", msg, "palavras ou passphrase diferentes");
+  }
 }
 
 void start_tool_erase() {
@@ -1102,7 +1175,8 @@ void activate_menu_row() {
       break;
     case kTabTools:
       if (g_row == kRowTestBackup) {
-        start_tool_test();
+        g_row = 0;
+        g_state = State::kToolVerifySource;
       } else if (g_row == kRowEraseBackup) {
         start_tool_erase();
       } else if (g_row == kRowBrightness) {
@@ -1186,7 +1260,11 @@ void handle_key(const KeyEvent &key) {
 
     case State::kMnemonicEntry: {
       if (key.esc) {
-        go_to_start("");
+        if (g_verify_mode) {
+          abort_verify();
+        } else {
+          go_to_start("");
+        }
         break;
       }
       if ((key.ch == kKeyUp) || (key.ch == kKeyLeft)) {
@@ -1209,7 +1287,11 @@ void handle_key(const KeyEvent &key) {
 
     case State::kChecksumFailed:
       if (key.esc) {
-        go_to_start("");
+        if (g_verify_mode) {
+          abort_verify();
+        } else {
+          go_to_start("");
+        }
       } else if ((key.ch == kKeyLeft) && g_correction_index > 0) {
         g_correction_index--;
       } else if ((key.ch == kKeyRight) && g_correction_index < g_mnemonic.word_count() - 1) {
@@ -1222,13 +1304,21 @@ void handle_key(const KeyEvent &key) {
 
     case State::kPassphraseEntry:
       if (key.esc) {
-        go_to_start("");
+        if (g_verify_mode) {
+          abort_verify();
+        } else {
+          go_to_start("");
+        }
       } else if (key.tab) {
         g_passphrase.toggle_visibility();
       } else if (key.backspace) {
         g_passphrase.backspace();
       } else if (key.enter) {
-        attempt_derive_and_show_fingerprint();
+        if (g_verify_mode) {
+          verify_against_session();
+        } else {
+          attempt_derive_and_show_fingerprint();
+        }
       } else if (key.ch != 0) {
         g_passphrase.add_char(key.ch);
       }
@@ -1417,11 +1507,25 @@ void handle_key(const KeyEvent &key) {
       if (key.enter || key.esc) go_to_menu(kTabWallet);
       break;
 
+    case State::kToolVerifySource:
+      if (key.esc) {
+        go_to_menu(kTabTools);
+      } else if (key.ch == kKeyUp) {
+        g_row = (g_row + kVerifySourceCount - 1) % kVerifySourceCount;
+      } else if (key.ch == kKeyDown) {
+        g_row = (g_row + 1) % kVerifySourceCount;
+      } else if (key.enter) {
+        switch (g_row) {
+          case kVerify12: start_tool_verify_paper(kMnemonicWordsShort); break;
+          case kVerify24: start_tool_verify_paper(kMnemonicWordsLong); break;
+          case kVerifyCard: start_tool_test(); break;
+        }
+      }
+      break;
+
     case State::kToolTestPassword:
       if (key.esc) {
-        g_card_pw.wipe();
-        memzero(g_rfid_card, sizeof(g_rfid_card));
-        go_to_menu(kTabTools);
+        abort_verify();
       } else if (edit_card_password(&g_card_pw, key) && g_card_pw.length() > 0) {
         attempt_tool_test_decode();
       }

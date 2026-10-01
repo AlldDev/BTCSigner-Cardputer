@@ -154,8 +154,11 @@ libsecp256k1 (Bitcoin Core's library) is **not** used; trezor-crypto's own `secp
   `test_interrupted_write_keeps_old_or_new_backup` in sync.
 - `kRfidPbkdf2Iterations` is frozen: it isn't stored on the card, and `test_production_iterations_are_frozen`
   pins it. Changing it requires restore to keep trying the old value.
-- TOOLS > Testar backup decrypts only to verify: the mnemonic is zeroed before anything is drawn and
-  is never shown. Sector trailers are never written; auth tries `kMifareKeys` in order.
+- TOOLS > Testar backup (`g_verify_mode`) reuses the mnemonic/passphrase entry screens to re-derive
+  a key from a paper or RFID backup and compares it with the session via `same_account()`. The
+  mnemonic is never drawn; everything except the session is wiped before the result and on ESC
+  (`abort_verify()`), which returns to TOOLS without ending the session. Sector trailers are never
+  written; auth tries `kMifareKeys` in order.
 - Never call the `PICC_Dump*`/`PCD_DumpVersionToSerial` functions of `MFRC522_I2C`, and don't add
   `Serial`/`ESP_LOG` output to `rfid_*` files.
 - PSBT validation is fail-closed by design: anything the parser can't fully verify (unrecognized

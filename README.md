@@ -106,8 +106,8 @@ silêncio.
   gravar a seed **cifrada** (AES-256 + HMAC, chave derivada de uma senha longa por PBKDF2) num
   cartão MIFARE Classic, com a M5Stack Unit RFID2. A passphrase nunca vai para o cartão. O cartão
   deve ser tratado como público: a segurança depende só da força da senha. O cartão guarda duas
-  cópias, e uma gravação interrompida não perde o backup. Na aba TOOLS dá para testar a senha do
-  cartão e apagar o backup. Nada disso acontece se você não pedir. Detalhes e modelo de ameaça em [`firmware/README.md`](./firmware/README.md#backup-opcional-no-cartão-rfid).
+  cópias, e uma gravação interrompida não perde o backup. Na aba TOOLS dá para conferir o backup
+  (papel ou cartão, com a passphrase) contra a sessão aberta e apagar o backup do cartão. Nada disso acontece se você não pedir. Detalhes e modelo de ameaça em [`firmware/README.md`](./firmware/README.md#backup-opcional-no-cartão-rfid).
 - **Criptografia auditada, não caseira**: toda a parte de curva elíptica, hash e derivação vem do
   `trezor-crypto`, a mesma biblioteca das carteiras Trezor.
 - **Fail-closed**: o que não pode ser verificado não é assinado.

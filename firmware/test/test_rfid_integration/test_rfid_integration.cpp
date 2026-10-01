@@ -226,11 +226,15 @@ static void test_passphrase_is_not_on_card(void) {
   uint32_t fp1 = 0;
   first_session_with_backup(kPassphrase, zpub1, &fp1);
 
-  // Restaurar com a passphrase certa: mesma carteira.
+  // Restaurar com a passphrase certa: mesma carteira (o que TOOLS > Testar
+  // backup confere contra a sessao).
+  MasterKey original;
+  TEST_ASSERT_TRUE(derive_master_key(kMnemonic, kPassphrase, Network::kMainnet, &original));
   MasterKey ok;
   TEST_ASSERT_EQUAL_INT(static_cast<int>(RfidCardStatus::kOk),
                         static_cast<int>(restore_session(kCardPassword, kPassphrase, &ok)));
   TEST_ASSERT_EQUAL_HEX32(fp1, ok.master_fingerprint);
+  TEST_ASSERT_TRUE(same_account(original, ok));
   wipe(&ok);
   wipe_seed_material();
 
@@ -239,6 +243,8 @@ static void test_passphrase_is_not_on_card(void) {
   TEST_ASSERT_EQUAL_INT(static_cast<int>(RfidCardStatus::kOk),
                         static_cast<int>(restore_session(kCardPassword, "", &attacker)));
   TEST_ASSERT_NOT_EQUAL(fp1, attacker.master_fingerprint);
+  TEST_ASSERT_FALSE(same_account(original, attacker));
+  wipe(&original);
   char zpub_attacker[XPUB_MAXLEN];
   zpub_of(attacker, zpub_attacker);
   TEST_ASSERT_TRUE(strcmp(zpub1, zpub_attacker) != 0);

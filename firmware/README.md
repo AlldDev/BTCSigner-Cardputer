@@ -130,7 +130,8 @@ Recurso **opt-in**: por padrão nada muda, e a seed continua sendo digitada a ca
 confirmar o fingerprint de uma seed **digitada**, o firmware oferece gravar uma cópia cifrada num
 cartão MIFARE Classic 1K/4K pela **M5Stack Unit RFID2** (chip WS1850S, compatível com o MFRC522).
 Na tela inicial, "Restaurar do cartão" lê essa cópia em vez de pedir as palavras. Durante a sessão,
-a aba **TOOLS** permite testar a senha e a integridade do backup e apagá-lo. A **passphrase
+a aba **TOOLS** permite conferir o backup (em papel ou no cartão) contra a sessão aberta e apagar o
+backup do cartão. A **passphrase
 nunca vai para o cartão**: ela continua sendo digitada depois da restauração, então segue valendo
 como segundo fator.
 
@@ -198,10 +199,18 @@ aes_key/mac_key = HMAC-SHA256(master, "BTCSigner-RFID-v1-enc" / "...-mac")
   cai rápido; não medem força de verdade. A cifra
   acontece antes de tocar no cartão, e a senha é zerada logo depois. Depois de gravar, o cartão é
   relido e comparado. Um cartão com dados pede confirmação antes de ser sobrescrito.
-- **TOOLS > Testar backup RFID.** Lê o cartão, pede a senha e decifra só para conferir. O
-  mnemônico é zerado antes de qualquer desenho e nunca aparece na tela. Mostra o número de palavras
-  e qual cópia abriu. Se só a B abriu, a A está danificada, e a tela pede para gravar de novo. O
-  teste não compara com a seed da sessão, porque o mnemônico e a passphrase já saíram da RAM.
+- **TOOLS > Testar backup.** Confere um backup contra a sessão aberta, partindo de três origens:
+  papel com 12 palavras, papel com 24 palavras, ou cartão RFID (lê o cartão e pede a senha). Nos
+  três casos, no fim a passphrase é digitada de novo. O firmware deriva a chave e compara com a da
+  sessão por `same_account()` (`keys.h`): mesma rede, mesmo fingerprint, e mesma chave privada e
+  chain code da conta, em tempo constante. O resultado é "Confere com a sessão" ou "NÃO confere",
+  com o fingerprint obtido. Isso prova que o backup **mais a passphrase que você lembra**
+  reconstroem a carteira aberta. Como o mnemônico e a passphrase saem da RAM quando a sessão começa,
+  não há outro jeito sem guardar algo derivado da seed. As telas de digitação são as mesmas da
+  entrada inicial, com checksum e correção de palavra. Durante o teste, o mnemônico volta à RAM
+  (nunca é desenhado) e é zerado, com a passphrase e a chave derivada, antes do resultado aparecer.
+  O ESC em qualquer etapa zera tudo e volta para TOOLS sem encerrar a sessão. Se só a cópia B do
+  cartão abriu, a A está danificada, e a tela pede para gravar de novo.
 - **TOOLS > Apagar backup RFID.** Lê o cartão (se já estiver vazio, avisa), pede para segurar
   Enter e grava zeros nos 47 blocos, conferindo depois. Não pede a senha de propósito: qualquer app
   NFC já apaga o cartão com a chave de fábrica, e exigir a senha impediria apagar um backup cuja
@@ -248,8 +257,8 @@ ASCII (a fonte 6x8 do M5GFX não tem acentos).
 
 - **Menu em abas**: `,` `/` trocam de aba, `;` `.` movem, Enter abre. ASSINAR = lista de `.psbt`
   do SD; CARTEIRA = fingerprint, rede, script, exportar xpub, endereço de recebimento; SESSAO =
-  bloqueio automático (informativo) e encerrar sessão; TOOLS = testar e apagar o backup RFID e
-  brilho (Enter cicla 30/50/70/100%, não persiste).
+  bloqueio automático (informativo) e encerrar sessão; TOOLS = testar backup (papel ou cartão,
+  contra a sessão), apagar o backup RFID e brilho (Enter cicla 30/50/70/100%, não persiste).
 - **Fontes**: conteúdo em `AsciiFont8x16` (29 caracteres/linha com margem de 4 px),
   header/rodapé/rótulos em 6x8. Endereços sempre completos: P2WPKH ocupa 2 linhas, P2WSH/P2TR 3. Se
   não couber, `draw_address` cai para 6x8 em vez de cortar. A quebra (`wrap_next_line`) é testada
