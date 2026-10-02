@@ -35,6 +35,11 @@ struct MasterKey {
 bool derive_master_key(const char *mnemonic, const char *passphrase,
                        Network network, MasterKey *out);
 
+// derive_master_key() para o tipo de script escolhido na tela SCRIPT. Hoje
+// so kP2wpkh (BIP84); qualquer outro valor falha com `out` zerado.
+bool derive_master_key_for(WalletScript script, const char *mnemonic, const char *passphrase,
+                           Network network, MasterKey *out);
+
 // Deriva o node privado completo em m/84'/coin'/0'/change/index a partir da
 // MasterKey (que ja e a subarvore da conta). O chamador e responsavel por
 // chamar wipe_node() no resultado assim que terminar de usa-lo.
@@ -45,6 +50,19 @@ bool derive_child_node(const MasterKey &mk, uint32_t change, uint32_t index,
 // out_addr deve ter pelo menos 74 bytes.
 bool derive_address(const MasterKey &mk, uint32_t change, uint32_t index,
                     char *out_addr, size_t out_len);
+
+// Indice digitado na tela RECEBER: 1 a 3 digitos ASCII (sem sinal/espaco),
+// valor <= kMaxReceiveIndex. false para qualquer outra coisa, inclusive "".
+bool parse_receive_index(const char *s, uint32_t *out);
+
+// Endereco de recebimento m/84'/coin'/0'/0/index, calculado por dois
+// caminhos que precisam dar o mesmo resultado: (A) derive_address(), pela
+// chave privada; (B) a partir do zpub/vpub exportado, por derivacao publica,
+// como a carteira watch-only faz. Depois, o endereco e decodificado de volta
+// e tem que dar witness v0 com o mesmo hash. Qualquer divergencia: false e
+// out vazio. Rejeita index > kMaxReceiveIndex. out_len >= 74.
+bool derive_receive_address_checked(const MasterKey &mk, uint32_t index, char *out,
+                                    size_t out_len);
 
 // zpub (mainnet) / vpub (testnet) da conta, formato SLIP-132.
 // out deve ter pelo menos XPUB_MAXLEN bytes.

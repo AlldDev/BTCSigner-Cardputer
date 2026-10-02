@@ -31,11 +31,12 @@ bool format_btc(uint64_t sats, char *out, size_t out_len);
 // "50000 sats".
 bool format_sats(uint64_t sats, char *out, size_t out_len);
 
-// Estimativa de tamanho em vbytes de uma transacao so com entradas/saidas
-// P2WPKH (unica topologia que este firmware assina): ~10.5 vB fixos + ~68
-// vB por input + ~31 vB por output. E uma aproximacao documentada, comum
-// entre carteiras para esse caso, nao um calculo exato de weight/witness.
-double estimate_vbytes(int num_inputs, int num_outputs);
+// Estimativa de tamanho em vbytes da transacao: ~10.5 vB fixos + ~68 vB por
+// input (sempre P2WPKH, unico tipo que este firmware assina) + o tamanho de
+// cada output pelo tipo de script: P2WPKH 31, P2WSH 43, P2TR 43, P2PKH 34,
+// P2SH 32 (kUnknown conta como P2WPKH). E uma aproximacao documentada, comum
+// entre carteiras, nao um calculo exato de weight/witness.
+double estimate_vbytes(const PsbtSummary &summary);
 
 // Texto pronto para exibir de UM output do PsbtSummary.
 struct OutputReviewText {
@@ -43,6 +44,7 @@ struct OutputReviewText {
   char amount_btc[24] = {0};
   char amount_sats[24] = {0};
   bool is_change = false;
+  uint32_t change_chain = 0; // 0 = endereco de recebimento proprio, 1 = troco
   uint32_t change_index = 0;
   bool change_index_high = false;
   bool claimed_change_invalid = false;
@@ -53,8 +55,14 @@ void build_output_review(const OutputInfo &output, OutputReviewText *out);
 struct FeeReviewText {
   char fee_sats[24] = {0};
   char fee_rate[32] = {0}; // "~X.X sat/vB", vazio se num_inputs/outputs == 0
+  char spend_total[24] = {0}; // "0.01260000 BTC": externos + taxa
+  char locktime[32] = {0};    // "bloco 850000" / "unix 1735689600"; vazio se 0
+  bool rbf = false;
   bool high_fee_warning = false;
 };
+
+// A tela DETALHES (RBF/locktime) so aparece quando ha algo a mostrar.
+bool fee_review_has_details(const FeeReviewText &text);
 void build_fee_review(const PsbtSummary &summary, FeeReviewText *out);
 
 } // namespace btcseed

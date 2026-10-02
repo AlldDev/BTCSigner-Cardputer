@@ -42,7 +42,8 @@ A seed nunca é gerada nem gravada no aparelho. Ela é digitada a cada sessão, 
 apagada ao encerrar a sessão ou depois de alguns minutos sem uso. Desligou, esqueceu.
 
 O escopo é estreito de propósito: carteira single-sig BIP84 (endereços `bc1q…`, native SegWit),
-PSBT v0, `SIGHASH_ALL`. Menos coisa suportada é menos coisa para dar errado.
+PSBT v0, `SIGHASH_ALL`. Menos coisa suportada é menos coisa para dar errado. Somente SegWit nativo
+(BIP84) por enquanto; Taproot (BIP86) está planejado.
 
 ---
 
@@ -61,7 +62,7 @@ O único canal entre os dois lados é o cartão microSD. O computador nunca vê 
 Cardputer nunca vê a internet.
 
 Antes de assinar, o firmware mostra na tela **cada saída da transação com o endereço completo** e o
-valor, depois o resumo de taxa, e só assina se você **segurar Enter** por 1,5 s. Qualquer coisa que
+valor, depois o resumo (taxa e total que sai da carteira), RBF/locktime quando a transação tiver, e só assina se você **segurar Enter** por 1,5 s. Qualquer coisa que
 ele não consiga verificar por inteiro (um input que não é desta seed, um troco que não bate com a
 derivação, um script que não sabe exibir) faz a PSBT ser rejeitada ou sinalizada, nunca aceita em
 silêncio.
@@ -79,8 +80,9 @@ silêncio.
 1. **Gere a seed fora do aparelho**, num computador offline (ex: o HTML standalone do
    [Ian Coleman BIP39 Tool](https://github.com/iancoleman/bip39/releases) num live USB sem rede,
    de preferência com entropia de dados físicos). Anote as palavras à mão e o master fingerprint.
-2. **Ligue o Cardputer e digite as 12 ou 24 palavras**, com autocomplete da wordlist BIP39 e
-   checagem do checksum. Passphrase (25ª palavra) opcional.
+2. **Ligue o Cardputer, escolha a rede e o tipo de carteira** (SegWit nativo; Taproot aparece como
+   "em breve") e **digite as 12 ou 24 palavras**, com autocomplete da wordlist BIP39 e checagem do
+   checksum. Passphrase (25ª palavra) opcional.
 3. **Confira o fingerprint e o endereço #0** exibidos com o que você anotou — se não baterem, a seed
    ou a passphrase está errada.
 4. **Exporte o zpub** para o microSD (`wallet_export.txt`, com os output descriptors) e importe no
@@ -106,7 +108,7 @@ silêncio.
   gravar a seed **cifrada** (AES-256 + HMAC, chave derivada de uma senha longa por PBKDF2) num
   cartão MIFARE Classic, com a M5Stack Unit RFID2. A passphrase nunca vai para o cartão. O cartão
   deve ser tratado como público: a segurança depende só da força da senha. O cartão guarda duas
-  cópias, e uma gravação interrompida não perde o backup. Na aba TOOLS dá para conferir o backup
+  cópias, e uma gravação interrompida não perde o backup. Na área TOOLS dá para conferir o backup
   (papel ou cartão, com a passphrase) contra a sessão aberta e apagar o backup do cartão. Nada disso acontece se você não pedir. Detalhes e modelo de ameaça em [`firmware/README.md`](./firmware/README.md#backup-opcional-no-cartão-rfid).
 - **Criptografia auditada, não caseira**: toda a parte de curva elíptica, hash e derivação vem do
   `trezor-crypto`, a mesma biblioteca das carteiras Trezor.

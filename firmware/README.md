@@ -23,7 +23,7 @@ Documentação técnica do firmware. Para a visão geral do projeto, ver o
 
 **Validado em testnet num Cardputer real, ainda não usado em mainnet.** O núcleo criptográfico e o
 parser de PSBT estão testados contra vetores oficiais e casos maliciosos no host. O fluxo de telas,
-o teclado e a E/S no microSD rodam no aparelho físico: entrada de seed, aba CARTEIRA, listagem de
+o teclado e a E/S no microSD rodam no aparelho físico: entrada de seed, área CARTEIRA, listagem de
 `.psbt` e assinatura gravando `*_signed.psbt` no cartão, tudo em testnet. O firmware **não deve
 ser usado com fundos reais** antes do primeiro uso em mainnet com valores pequenos (ver
 [O que falta](#o-que-falta)).
@@ -116,11 +116,11 @@ tem a E/S de fato (Arduino `SD.h`/`SPI.h`) e só compila no ambiente `cardputer`
 - **Layout no cartão**: PSBTs em `/psbt/*.psbt` (até 32 listadas), assinadas gravadas como
   `<nome>_signed.psbt`, export em `/wallet_export.txt`.
 - **Troca a quente**: dá para inserir, tirar ou trocar o microSD com o aparelho ligado. Ao entrar na
-  aba ASSINAR (e antes de exportar o xpub), o firmware desmonta e monta o cartão de novo
+  lista ASSINAR (e antes de exportar o xpub), o firmware desmonta e monta o cartão de novo
   (`sd_remount()`), para nunca escrever num cartão trocado com a FAT em cache do anterior. A
-  tecla **R** na aba ASSINAR faz o mesmo na hora. Sem cartão montado, a aba tenta montar a cada
+  tecla **R** na lista ASSINAR faz o mesmo na hora. Sem cartão montado, a lista tenta montar a cada
   2 s (`kSdPollMs`), então um cartão inserido aparece sozinho. Uma remoção só é percebida no
-  próximo R, na próxima entrada na aba ou quando uma leitura/gravação falha.
+  próximo R, na próxima entrada na lista ou quando uma leitura/gravação falha.
 
 ---
 
@@ -130,7 +130,7 @@ Recurso **opt-in**: por padrão nada muda, e a seed continua sendo digitada a ca
 confirmar o fingerprint de uma seed **digitada**, o firmware oferece gravar uma cópia cifrada num
 cartão MIFARE Classic 1K/4K pela **M5Stack Unit RFID2** (chip WS1850S, compatível com o MFRC522).
 Na tela inicial, "Restaurar do cartão" lê essa cópia em vez de pedir as palavras. Durante a sessão,
-a aba **TOOLS** permite conferir o backup (em papel ou no cartão) contra a sessão aberta e apagar o
+a área **TOOLS** permite conferir o backup (em papel ou no cartão) contra a sessão aberta e apagar o
 backup do cartão. A **passphrase
 nunca vai para o cartão**: ela continua sendo digitada depois da restauração, então segue valendo
 como segundo fator.
@@ -255,10 +255,13 @@ convenções cobrem a lacuna (documentadas em `ui.h`):
 + bateria, rodapé com dica/ação, splash de boot e telas de sucesso/erro com ícone. Textos só em
 ASCII (a fonte 6x8 do M5GFX não tem acentos).
 
-- **Menu em abas**: `,` `/` trocam de aba, `;` `.` movem, Enter abre. ASSINAR = lista de `.psbt`
-  do SD; CARTEIRA = fingerprint, rede, script, exportar xpub, endereço de recebimento; SESSAO =
-  bloqueio automático (informativo) e encerrar sessão; TOOLS = testar backup (papel ou cartão,
-  contra a sessão), apagar o backup RFID e brilho (Enter cicla 30/50/70/100%, não persiste).
+- **Menu em carrossel**: depois da seed, um carrossel infinito de ícones (ASSINAR, CARTEIRA, TOOLS,
+  SESSAO): `,` `/` deslizam entre as áreas (do último volta ao primeiro), Enter abre a lista da
+  área e ESC volta ao carrossel. Na lista, `;` `.` movem e Enter abre. ASSINAR = lista de `.psbt`
+  do SD; CARTEIRA = fingerprint, rede, script, exportar xpub, endereço de recebimento; TOOLS =
+  testar backup (papel ou cartão, contra a sessão), apagar o backup RFID e brilho (Enter cicla
+  30/50/70/100%, não persiste); SESSAO = bloqueio automático (informativo) e encerrar sessão. A
+  animação usa um sprite de 240x62 (~30 KB) alocado só durante o deslize; sem heap, troca direto.
 - **Fontes**: conteúdo em `AsciiFont8x16` (29 caracteres/linha com margem de 4 px),
   header/rodapé/rótulos em 6x8. Endereços sempre completos: P2WPKH ocupa 2 linhas, P2WSH/P2TR 3. Se
   não couber, `draw_address` cai para 6x8 em vez de cortar. A quebra (`wrap_next_line`) é testada
@@ -269,8 +272,20 @@ ASCII (a fonte 6x8 do M5GFX não tem acentos).
   bater com *Account Extended Public Key*. "Baixar arquivo" grava também os output descriptors
   BIP380 (`wpkh([fp/84h/0h/0h]xpub/0/*)#checksum` e `/1/*`), importáveis direto no Sparrow/Core.
 - **TESTNET** aparece em vermelho no header de toda tela depois que a rede foi escolhida.
-- **Revisão**: cada saída é mostrada uma a uma com o endereço COMPLETO, depois o resumo de taxa e,
-  por fim, **segurar Enter por `kHoldToSignMs` (1,5 s)** para assinar. Soltar antes zera a barra, e
+- **Tipo de carteira (tela SCRIPT)**: depois da rede e antes da seed (ou da senha do cartão), como
+  no Electrum, porque o tipo de script define a derivação. Só "SegWit nativo" (BIP84, `m/84'`) é
+  selecionável; "Taproot (em breve)" aparece em cinza e o cursor não para nela. A escolha passa por
+  `derive_master_key_for()` (`keys.h`), que recusa qualquer tipo que não seja P2WPKH.
+- **Endereço de recebimento** (CARTEIRA): índice de 0 a 999 (`kMaxReceiveIndex`, no máximo 3
+  dígitos). O endereço vem de `derive_receive_address_checked()`, que o calcula pela chave privada
+  e de novo a partir do zpub exportado (derivação pública, como a watch-only faz), e decodifica o
+  bech32 de volta. Só aparece se tudo bater; senão, "(falha na verificacao)". O endereço #0 da tela
+  de fingerprint usa a mesma função.
+- **Revisão**: cada saída é mostrada uma a uma com o endereço COMPLETO. Uma saída desta seed em
+  `/1/i` é "TROCO #i"; em `/0/i` é "PROPRIO receb. #i". Depois vem o RESUMO (entradas/saídas,
+  taxa, sat/vB estimado por tipo de script de cada saída e o total enviado = saídas externas +
+  taxa). Se a tx sinaliza RBF (alguma `nSequence < 0xfffffffe`) ou tem `nLockTime`, aparece a tela
+  DETALHES. Por fim, **segurar Enter por `kHoldToSignMs` (1,5 s)** para assinar. Soltar antes zera a barra, e
   o Enter vindo da tela anterior não conta: é preciso soltar e segurar de novo.
 - **Sessão** expira após `kSessionTimeoutMs` (3 min) sem uso, apagando a chave da RAM.
 
@@ -345,7 +360,9 @@ Vetores e casos cobertos:
   máximo `2147483647'` e derivação não-hardened), de `bip-0032.mediawiki`.
 - **BIP84**: vetor oficial de `bip-0084.mediawiki` (zpub da conta + endereços de recebimento/troco),
   exercitando a pilha completa deste firmware (mnemonic → seed → conta → zpub/endereços), não só o
-  trezor-crypto cru.
+  trezor-crypto cru. O endereço de recebimento verificado é conferido contra vetores gerados à parte
+  com o `embit` (Python; mainnet e testnet, índices 0, 1 e 999). Os dois caminhos (privado e pelo
+  zpub) também são comparados em toda a faixa 0..999.
 - **PSBT**: uma PSBT válida construída à mão (input nosso + output externo + troco verdadeiro) —
   valida, calcula taxa/aviso, assina, e a assinatura é conferida com `ecdsa_verify_digest` contra um
   sighash BIP143 recalculado de forma independente do código de produção (pegou um bug real: um

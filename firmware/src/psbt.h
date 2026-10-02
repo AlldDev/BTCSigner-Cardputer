@@ -54,11 +54,24 @@ enum class PsbtError {
   kBufferTooSmall,         // serialize_signed: buffer de saida pequeno demais
 };
 
+// Tipo do scriptPubKey de um output (so os que fill_output_info() exibe).
+// Usado para estimar o tamanho da tx; nao muda nenhuma validacao.
+enum class OutputScriptType : uint8_t {
+  kUnknown = 0,
+  kP2WPKH,
+  kP2WSH,
+  kP2TR,
+  kP2PKH,
+  kP2SH,
+};
+
 // Resumo de um output, para a tela de revisao (review_screens.cpp).
 struct OutputInfo {
   char address[76] = {0};   // endereco formatado; vazio se script nao suportado
   uint64_t amount_sats = 0;
+  OutputScriptType script_type = OutputScriptType::kUnknown;
   bool is_change = false;          // derivacao E script batem com nossa seed
+  uint32_t change_chain = 0;       // valido apenas se is_change: 0 = /0/i (recebimento), 1 = /1/i (troco)
   uint32_t change_index = 0;       // valido apenas se is_change
   bool change_index_high = false;  // is_change com indice > kChangeIndexWarning
   // O output alega (via PSBT_OUT_BIP32_DERIVATION) ser troco desta sessao,
@@ -74,6 +87,10 @@ struct PsbtSummary {
   uint64_t total_output_sats = 0;
   uint64_t fee_sats = 0;
   bool high_fee_warning = false;
+  uint64_t external_sats = 0;    // soma dos outputs que nao sao desta seed
+  uint64_t spend_total_sats = 0; // external_sats + fee_sats: o que sai da carteira
+  uint32_t locktime = 0;         // nLockTime da tx nao assinada
+  bool rbf = false;              // algum input com nSequence < 0xfffffffe (BIP125)
   OutputInfo outputs[kMaxPsbtOutputs];
 };
 

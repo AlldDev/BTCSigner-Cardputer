@@ -158,8 +158,10 @@
       <div class="campo-valor" id="mnemonicaCarteira"></div>
       <label>Master fingerprint — deve bater com o mostrado no Cardputer</label>
       <div class="campo-valor" id="fingerprintCarteira"></div>
-      <label>Endereço m/84'/1'/0'/0/0 (P2WPKH / bech32)</label>
+      <label>Endereço de recebimento — próximo não usado (P2WPKH / bech32)</label>
       <div class="campo-valor" id="enderecoCarteira"></div>
+      <label>Próximo endereço de troco</label>
+      <div class="campo-valor" id="enderecoTroco"></div>
       <button class="secundario" onclick="esquecerCarteira()">Esquecer carteira deste navegador</button>
     </div>
   </div>
@@ -242,25 +244,85 @@ const ECPair = ECPairFactory(ecc);
 
 const REDE = bitcoin.networks.testnet;
 const API_BASE = 'https://mempool.space/testnet4/api';
-// BIP84 testnet, igual ao firmware. Recebe e recebe troco no mesmo endereco (o firmware aceita change 0 ou 1).
-const CAMINHO = "m/84'/1'/0'/0/0";
+// Conta BIP84 testnet, igual ao firmware. Cadeia 0 = recebimento, 1 = troco (padrao Electrum/Sparrow).
+const CONTA = "m/84'/1'/0'";
+const CADEIA_RECEBIMENTO = 0;
+const CADEIA_TROCO = 1;
+// gap limits padrao do Electrum: para de varrer apos N enderecos seguidos sem historico
+const GAP_RECEBIMENTO = 20;
+const GAP_TROCO = 10;
+const REQUISICOES_SIMULTANEAS = 5; // mempool.space devolve 429 se abusar
 const CHAVE_STORAGE = 'psbt_lab_carteira_v2';
 
-let carteira = null; // { mnemonic, address, fingerprint (Uint8Array 4), pubkey, privateKey }
-let utxosCarregados = [];
+// { mnemonic, raiz, conta, fingerprint (Uint8Array 4), address (recebimento atual), proximoRecebimento, proximoTroco }
+let carteira = null;
+let utxosCarregados = []; // cada um com .info = enderecoEm(...) do endereco dono
+const cacheEnderecos = new Map();
 
 function derivarCarteira(mnemonic) {
   if (!bip39.validateMnemonic(mnemonic, wordlist)) throw new Error('mnemônica inválida');
   const raiz = HDKey.fromMasterSeed(bip39.mnemonicToSeedSync(mnemonic));
-  const filho = raiz.derive(CAMINHO);
   const fingerprint = new Uint8Array(4);
   new DataView(fingerprint.buffer).setUint32(0, raiz.fingerprint);
-  const { address } = bitcoin.payments.p2wpkh({ pubkey: filho.publicKey, network: REDE });
-  return { mnemonic, address, fingerprint, pubkey: filho.publicKey, privateKey: filho.privateKey };
+  cacheEnderecos.clear();
+  const nova = { mnemonic, raiz, conta: raiz.derive(CONTA), fingerprint, proximoRecebimento: 0, proximoTroco: 0 };
+  carteira = nova;
+  nova.address = enderecoEm(CADEIA_RECEBIMENTO, 0).address;
+  return nova;
 }
 
-function derivacaoBip32() {
-  return [{ masterFingerprint: carteira.fingerprint, path: CAMINHO, pubkey: carteira.pubkey }];
+function enderecoEm(cadeia, indice) {
+  const chave = `${cadeia}/${indice}`;
+  if (!cacheEnderecos.has(chave)) {
+    const pubkey = carteira.conta.deriveChild(cadeia).deriveChild(indice).publicKey;
+    const { address, output } = bitcoin.payments.p2wpkh({ pubkey, network: REDE });
+    cacheEnderecos.set(chave, { cadeia, indice, path: `${CONTA}/${chave}`, pubkey, address, script: output });
+  }
+  return cacheEnderecos.get(chave);
+}
+
+function derivacaoBip32(info) {
+  return [{ masterFingerprint: carteira.fingerprint, path: info.path, pubkey: info.pubkey }];
+}
+
+async function mapLimitado(itens, limite, fn) {
+  const resultados = new Array(itens.length);
+  let proximo = 0;
+  const trabalhador = async () => {
+    while (proximo < itens.length) {
+      const i = proximo++;
+      resultados[i] = await fn(itens[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limite, itens.length) }, trabalhador));
+  return resultados;
+}
+
+async function buscarJson(caminho) {
+  const resp = await fetch(`${API_BASE}${caminho}`);
+  if (!resp.ok) throw new Error(`${caminho}: HTTP ${resp.status}`);
+  return resp.json();
+}
+
+// Varre a cadeia em janelas ate achar `gap` enderecos seguidos sem nenhuma tx (confirmada ou na mempool).
+async function varrerCadeia(cadeia, gap) {
+  const usados = [];
+  let ultimoUsado = -1;
+  let inicio = 0;
+  while (inicio <= ultimoUsado + gap) {
+    const indices = [];
+    for (let i = inicio; i <= ultimoUsado + gap; i++) indices.push(i);
+    const stats = await mapLimitado(indices, REQUISICOES_SIMULTANEAS,
+      i => buscarJson(`/address/${enderecoEm(cadeia, i).address}`));
+    stats.forEach((s, k) => {
+      if (s.chain_stats.tx_count + s.mempool_stats.tx_count > 0) {
+        usados.push(enderecoEm(cadeia, indices[k]));
+        ultimoUsado = Math.max(ultimoUsado, indices[k]);
+      }
+    });
+    inicio = indices[indices.length - 1] + 1;
+  }
+  return { usados, proximo: ultimoUsado + 1 };
 }
 
 function salvarCarteiraLocal() {
@@ -281,11 +343,20 @@ function exibirCarteira() {
   document.getElementById('mnemonicaCarteira').textContent = carteira.mnemonic;
   document.getElementById('fingerprintCarteira').textContent =
     Array.from(carteira.fingerprint, b => b.toString(16).padStart(2, '0')).join('');
-  document.getElementById('enderecoCarteira').textContent = carteira.address;
+  exibirEnderecos();
   document.getElementById('cardSaldo').classList.remove('oculto');
   document.getElementById('cardCriar').classList.remove('oculto');
   document.getElementById('cardAssinar').classList.remove('oculto');
   document.getElementById('cardTransmitir').classList.remove('oculto');
+  atualizarUtxos(); // descobre os proximos enderecos livres antes do usuario pedir
+}
+
+function exibirEnderecos() {
+  const recebimento = enderecoEm(CADEIA_RECEBIMENTO, carteira.proximoRecebimento);
+  const troco = enderecoEm(CADEIA_TROCO, carteira.proximoTroco);
+  carteira.address = recebimento.address;
+  document.getElementById('enderecoCarteira').textContent = `${recebimento.address}  (${recebimento.path})`;
+  document.getElementById('enderecoTroco').textContent = `${troco.address}  (${troco.path})`;
 }
 
 function gerarCarteira() {
@@ -314,12 +385,21 @@ function esquecerCarteira() {
 
 async function atualizarUtxos() {
   const statusEl = document.getElementById('statusUtxos');
-  statusEl.textContent = 'Buscando UTXOs...';
+  statusEl.textContent = 'Varrendo endereços de recebimento e troco...';
   statusEl.className = 'status';
   try {
-    const resp = await fetch(`${API_BASE}/address/${carteira.address}/utxo`);
-    if (!resp.ok) throw new Error('Resposta HTTP ' + resp.status);
-    utxosCarregados = await resp.json();
+    const [recebimento, troco] = await Promise.all([
+      varrerCadeia(CADEIA_RECEBIMENTO, GAP_RECEBIMENTO),
+      varrerCadeia(CADEIA_TROCO, GAP_TROCO)
+    ]);
+    carteira.proximoRecebimento = recebimento.proximo;
+    carteira.proximoTroco = troco.proximo;
+    exibirEnderecos();
+
+    const usados = [...recebimento.usados, ...troco.usados];
+    const listas = await mapLimitado(usados, REQUISICOES_SIMULTANEAS,
+      info => buscarJson(`/address/${info.address}/utxo`).then(us => us.map(u => ({ ...u, info }))));
+    utxosCarregados = listas.flat();
 
     const total = utxosCarregados.reduce((soma, u) => soma + u.value, 0);
     document.getElementById('saldoTotal').textContent =
@@ -330,7 +410,7 @@ async function atualizarUtxos() {
     utxosCarregados.forEach(u => {
       const div = document.createElement('div');
       div.className = 'utxo-item';
-      div.innerHTML = `<span>${u.txid.slice(0, 16)}...:${u.vout}</span><span>${u.value} sats</span>`;
+      div.innerHTML = `<span>${u.txid.slice(0, 16)}...:${u.vout}</span><span>${u.info.cadeia}/${u.info.indice}</span><span>${u.value} sats</span>`;
       listaEl.appendChild(div);
     });
 
@@ -387,14 +467,13 @@ async function criarPsbt() {
     return;
   }
   if (utxosCarregados.length === 0) {
-    statusEl.textContent = 'Nenhum UTXO disponivel neste endereco.';
+    statusEl.textContent = 'Nenhum UTXO disponivel nesta carteira.';
     statusEl.className = 'status erro';
     return;
   }
 
   try {
     const psbt = new bitcoin.Psbt({ network: REDE });
-    const scriptOrigem = bitcoin.address.toOutputScript(carteira.address, REDE);
 
     let totalEntrada = 0;
     const necessario = valorSats + feeSats;
@@ -403,9 +482,9 @@ async function criarPsbt() {
       psbt.addInput({
         hash: utxo.txid,
         index: utxo.vout,
-        witnessUtxo: { script: scriptOrigem, value: BigInt(utxo.value) },
+        witnessUtxo: { script: utxo.info.script, value: BigInt(utxo.value) },
         nonWitnessUtxo: await buscarTxAnterior(utxo.txid),
-        bip32Derivation: derivacaoBip32() // o Cardputer recusa input sem isso
+        bip32Derivation: derivacaoBip32(utxo.info) // o Cardputer recusa input sem isso
       });
       totalEntrada += utxo.value;
       if (totalEntrada >= necessario) break;
@@ -420,9 +499,10 @@ async function criarPsbt() {
     psbt.addOutput({ address: destino, value: BigInt(valorSats) });
 
     const troco = totalEntrada - necessario;
+    const infoTroco = enderecoEm(CADEIA_TROCO, carteira.proximoTroco);
     if (troco > 546) {
-      // com a derivacao o Cardputer mostra "Troco (verificado)"
-      psbt.addOutput({ address: carteira.address, value: BigInt(troco), bip32Derivation: derivacaoBip32() });
+      // endereco novo da cadeia 1; com a derivacao o Cardputer mostra "Troco (verificado)"
+      psbt.addOutput({ address: infoTroco.address, value: BigInt(troco), bip32Derivation: derivacaoBip32(infoTroco) });
     }
 
     const base64 = psbt.toBase64();
@@ -430,7 +510,7 @@ async function criarPsbt() {
     document.getElementById('resultadoPsbtCriado').classList.remove('oculto');
     document.getElementById('psbtParaAssinar').value = base64;
 
-    statusEl.textContent = `PSBT criado com ${psbt.inputCount} entrada(s). Troco: ${troco > 546 ? troco + ' sats' : 'nenhum (abaixo do limite de poeira)'}.`;
+    statusEl.textContent = `PSBT criado com ${psbt.inputCount} entrada(s). Troco: ${troco > 546 ? `${troco} sats para ${infoTroco.address} (${infoTroco.path})` : 'nenhum (abaixo do limite de poeira)'}.`;
     statusEl.className = 'status ok';
   } catch (erro) {
     statusEl.textContent = 'Erro ao montar o PSBT: ' + erro.message;
@@ -447,12 +527,16 @@ function assinarComEstaCarteira() {
     return;
   }
   try {
-    const par = ECPair.fromPrivateKey(carteira.privateKey, { network: REDE });
     const psbt = bitcoin.Psbt.fromBase64(base64, { network: REDE });
 
-    for (let i = 0; i < psbt.inputCount; i++) {
-      psbt.signInput(i, par);
-    }
+    // cada input pode vir de um endereco diferente: deriva a chave pelo caminho declarado no PSBT
+    psbt.data.inputs.forEach((entrada, i) => {
+      const deriv = (entrada.bip32Derivation || []).find(d =>
+        d.masterFingerprint.every((b, k) => b === carteira.fingerprint[k]));
+      if (!deriv) throw new Error(`input ${i} sem derivação desta carteira`);
+      const chave = carteira.raiz.derive(deriv.path);
+      psbt.signInput(i, ECPair.fromPrivateKey(chave.privateKey, { network: REDE }));
+    });
     const ok = psbt.validateSignaturesOfAllInputs(
       (pubkey, hash, sig) => ECPair.fromPublicKey(pubkey).verify(hash, sig));
     if (!ok) throw new Error('assinatura inválida');

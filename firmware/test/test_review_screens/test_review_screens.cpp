@@ -98,8 +98,30 @@ static void test_estimate_vbytes(void) {
   // 1 input + 2 outputs P2WPKH: 10.5 + 68 + 62 = 140.5
   // TEST_ASSERT_EQUAL_DOUBLE exige Unity compilado com UNITY_INCLUDE_DOUBLE
   // (nao habilitado por padrao em builds embarcados) — usa float aqui.
-  TEST_ASSERT_FLOAT_WITHIN(0.001f, 140.5f,
-                          static_cast<float>(estimate_vbytes(1, 2)));
+  PsbtSummary summary{};
+  summary.num_inputs = 1;
+  summary.num_outputs = 2;
+  summary.outputs[0].script_type = OutputScriptType::kP2WPKH;
+  summary.outputs[1].script_type = OutputScriptType::kP2WPKH;
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 140.5f, static_cast<float>(estimate_vbytes(summary)));
+}
+
+static void test_estimate_vbytes_by_output_type(void) {
+  // 1 input + P2TR + P2WPKH: 10.5 + 68 + 43 + 31 = 152.5
+  PsbtSummary summary{};
+  summary.num_inputs = 1;
+  summary.num_outputs = 2;
+  summary.outputs[0].script_type = OutputScriptType::kP2TR;
+  summary.outputs[1].script_type = OutputScriptType::kP2WPKH;
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 152.5f, static_cast<float>(estimate_vbytes(summary)));
+
+  // 2 inputs + P2WSH + P2PKH + P2SH: 10.5 + 136 + 43 + 34 + 32 = 255.5
+  summary.num_inputs = 2;
+  summary.num_outputs = 3;
+  summary.outputs[0].script_type = OutputScriptType::kP2WSH;
+  summary.outputs[1].script_type = OutputScriptType::kP2PKH;
+  summary.outputs[2].script_type = OutputScriptType::kP2SH;
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 255.5f, static_cast<float>(estimate_vbytes(summary)));
 }
 
 static void test_build_output_review(void) {
@@ -144,6 +166,45 @@ static void test_build_output_review_propagates_change_index(void) {
   TEST_ASSERT_TRUE(text.is_change);
   TEST_ASSERT_EQUAL_UINT32(5000, text.change_index);
   TEST_ASSERT_TRUE(text.change_index_high);
+  TEST_ASSERT_EQUAL_UINT32(0, text.change_chain);
+
+  info.change_chain = 1;
+  build_output_review(info, &text);
+  TEST_ASSERT_EQUAL_UINT32(1, text.change_chain);
+}
+
+static void test_build_fee_review_spend_total_and_details(void) {
+  PsbtSummary summary{};
+  summary.num_inputs = 1;
+  summary.num_outputs = 2;
+  summary.fee_sats = 10000;
+  summary.spend_total_sats = 1260000;
+
+  FeeReviewText text;
+  build_fee_review(summary, &text);
+  TEST_ASSERT_EQUAL_STRING("0.01260000 BTC", text.spend_total);
+  TEST_ASSERT_EQUAL_STRING("", text.locktime);
+  TEST_ASSERT_FALSE(text.rbf);
+  TEST_ASSERT_FALSE(fee_review_has_details(text));
+
+  summary.locktime = 850000;
+  build_fee_review(summary, &text);
+  TEST_ASSERT_EQUAL_STRING("bloco 850000", text.locktime);
+  TEST_ASSERT_TRUE(fee_review_has_details(text));
+
+  summary.locktime = 499999999; // ultimo valor que ainda e altura
+  build_fee_review(summary, &text);
+  TEST_ASSERT_EQUAL_STRING("bloco 499999999", text.locktime);
+
+  summary.locktime = 1735689600;
+  build_fee_review(summary, &text);
+  TEST_ASSERT_EQUAL_STRING("unix 1735689600", text.locktime);
+
+  summary.locktime = 0;
+  summary.rbf = true;
+  build_fee_review(summary, &text);
+  TEST_ASSERT_TRUE(text.rbf);
+  TEST_ASSERT_TRUE(fee_review_has_details(text));
 }
 
 static void test_build_fee_review(void) {
@@ -186,6 +247,8 @@ int main(int argc, char **argv) {
   RUN_TEST(test_format_btc);
   RUN_TEST(test_format_sats);
   RUN_TEST(test_estimate_vbytes);
+  RUN_TEST(test_estimate_vbytes_by_output_type);
+  RUN_TEST(test_build_fee_review_spend_total_and_details);
   RUN_TEST(test_build_output_review);
   RUN_TEST(test_build_output_review_flags_forged_change);
   RUN_TEST(test_build_output_review_propagates_change_index);
