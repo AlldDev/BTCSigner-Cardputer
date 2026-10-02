@@ -85,6 +85,16 @@ bool derive_master_key(const char *mnemonic, const char *passphrase,
   return true;
 }
 
+bool derive_master_key_for(WalletScript script, const char *mnemonic, const char *passphrase,
+                           Network network, MasterKey *out) {
+  switch (script) {
+    case WalletScript::kP2wpkh:
+      return derive_master_key(mnemonic, passphrase, network, out);
+  }
+  if (out != nullptr) *out = MasterKey{};
+  return false;
+}
+
 bool derive_child_node(const MasterKey &mk, uint32_t change, uint32_t index,
                        HDNode *out_node) {
   if (!mk.valid || out_node == nullptr) {
@@ -162,6 +172,65 @@ uint64_t descriptor_polymod(uint64_t c, int val) {
 
 bool serialize_account_xpub(const MasterKey &mk, char *out, size_t out_len) {
   return serialize_account_pub(mk, xpub_version_for_network(mk.network), out, out_len);
+}
+
+bool parse_receive_index(const char *s, uint32_t *out) {
+  if (s == nullptr || out == nullptr) return false;
+  uint32_t v = 0;
+  size_t n = 0;
+  for (; s[n] != '\0'; n++) {
+    if (n >= 3 || s[n] < '0' || s[n] > '9') return false;
+    v = v * 10 + static_cast<uint32_t>(s[n] - '0');
+  }
+  if (n == 0 || v > kMaxReceiveIndex) return false;
+  *out = v;
+  return true;
+}
+
+bool derive_receive_address_checked(const MasterKey &mk, uint32_t index, char *out,
+                                    size_t out_len) {
+  if (out == nullptr || out_len < 74) return false;
+  out[0] = '\0';
+  if (!mk.valid || index > kMaxReceiveIndex || (index & 0x80000000u) != 0) return false;
+
+  // (A) chave privada da conta -> /0/index.
+  char addr_a[74];
+  if (!derive_address(mk, kChangeExternal, index, addr_a, sizeof(addr_a))) return false;
+
+  // (B) so o que sai no wallet_export.txt: zpub/vpub -> /0/index publico.
+  char xpub[XPUB_MAXLEN];
+  HDNode node;
+  uint8_t hash_b[20];
+  char addr_b[74];
+  bool ok = serialize_account_xpub(mk, xpub, sizeof(xpub)) &&
+            hdnode_deserialize_public(xpub, xpub_version_for_network(mk.network),
+                                      SECP256K1_NAME, &node, nullptr) == 0;
+  ok = ok && hdnode_public_ckd(&node, kChangeExternal) == 1 &&
+       hdnode_public_ckd(&node, index) == 1;
+  if (ok) {
+    ecdsa_get_pubkeyhash(node.public_key, node.curve->hasher_pubkey, hash_b);
+    ok = segwit_addr_encode(addr_b, hrp_for_network(mk.network), 0, hash_b,
+                            sizeof(hash_b)) == 1;
+  }
+  memzero(&node, sizeof(node));
+  memzero(xpub, sizeof(xpub));
+
+  ok = ok && strcmp(addr_a, addr_b) == 0;
+
+  // Ida e volta: o texto exibido decodifica para o mesmo programa witness v0.
+  if (ok) {
+    int ver = -1;
+    uint8_t prog[40];
+    size_t prog_len = 0;
+    ok = segwit_addr_decode(&ver, prog, &prog_len, hrp_for_network(mk.network), addr_a) == 1 &&
+         ver == 0 && prog_len == sizeof(hash_b) && memcmp(prog, hash_b, sizeof(hash_b)) == 0;
+    memzero(prog, sizeof(prog));
+  }
+  memzero(hash_b, sizeof(hash_b));
+  memzero(addr_b, sizeof(addr_b));
+  if (ok) memcpy(out, addr_a, strlen(addr_a) + 1);
+  memzero(addr_a, sizeof(addr_a));
+  return ok;
 }
 
 // Algoritmo de referencia do BIP380 (DescriptorChecksum do Bitcoin Core).

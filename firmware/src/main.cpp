@@ -40,6 +40,7 @@ namespace {
 enum class State {
   kSelectWordCount,
   kSelectNetwork,
+  kSelectScript, // tipo de carteira (SegWit nativo; Taproot em breve)
   kMnemonicEntry,
   kChecksumFailed,
   kPassphraseEntry,
@@ -55,6 +56,7 @@ enum class State {
   kMainMenu, // lista da area g_tab
   kPsbtReviewOutput,
   kPsbtReviewFee,
+  kPsbtReviewDetails, // RBF/locktime: so quando a tx tem algum dos dois
   kPsbtConfirm, // segurar Enter para assinar
   kPsbtDone,
   kError,
@@ -87,6 +89,7 @@ uint32_t g_sd_last_poll_ms = 0; // deteccao de cartao inserido na lista ASSINAR
 
 int g_word_count_choice = kMnemonicWordsLong;
 Network g_network_choice = Network::kMainnet;
+WalletScript g_script_choice = WalletScript::kP2wpkh;
 
 MnemonicInput g_mnemonic(kMnemonicWordsLong);
 char g_mnemonic_text[BIP39_MAX_MNEMONIC_LEN + 1] = {0};
@@ -243,6 +246,7 @@ void go_to_start(const char *reason) {
   g_verify_mode = false;
   g_word_count_choice = kMnemonicWordsLong;
   g_network_choice = Network::kMainnet;
+  g_script_choice = WalletScript::kP2wpkh;
   g_state = State::kSelectWordCount;
 }
 
@@ -321,6 +325,17 @@ void render_select_network() {
   ui_row(57, 24, "Testnet/Signet", "tb1...", g_network_choice == Network::kTestnet);
 }
 
+// Como no Electrum: o tipo de script define a derivacao, entao e escolhido
+// antes da seed. Taproot so aparece como informacao (o cursor nao para nele).
+void render_select_script() {
+  ui_begin_screen("SCRIPT", "ESC voltar", "OK continuar");
+  ui_text(kMargin, 20, "TIPO DE CARTEIRA", color::kMuted);
+  ui_row(31, 24, "SegWit nativo",
+         g_network_choice == Network::kMainnet ? "bc1q m/84'" : "tb1q m/84'",
+         g_script_choice == WalletScript::kP2wpkh);
+  ui_text(kMargin + 8, 64, "Taproot (em breve)", color::kMuted, Font::kBody);
+}
+
 void render_mnemonic_entry() {
   char title[24];
   snprintf(title, sizeof(title), "PALAVRA %d/%d", g_mnemonic.current_word_index() + 1,
@@ -378,16 +393,16 @@ void render_fingerprint_confirm() {
   ui_text(kScreenW / 2, 28, fp, color::kOrange, Font::kBig, Align::kCenter);
 
   char label[40];
-  snprintf(label, sizeof(label), "ENDERECO #0  m/84'/%d'/0'/0/0",
+  snprintf(label, sizeof(label), "ENDERECO #0 SegWit m/84'/%d'/0'/0/0",
            g_network_choice == Network::kMainnet ? 0 : 1);
   ui_text(kMargin, 50, label, color::kMuted);
   char addr[74];
-  if (derive_address(g_pending_mk, kChangeExternal, 0, addr, sizeof(addr))) {
+  if (derive_receive_address_checked(g_pending_mk, 0, addr, sizeof(addr))) {
     char grouped[100];
     format_address_grouped(addr, grouped, sizeof(grouped));
     draw_address(60, grouped);
   } else {
-    ui_text(kMargin, 60, "(falha ao derivar)", color::kError, Font::kBody);
+    ui_text(kMargin, 60, "(falha na verificacao)", color::kError, Font::kBody);
   }
   ui_text(kScreenW / 2, 100, "Confira com o anotado / Ian Coleman", color::kMuted,
           Font::kSmall, Align::kCenter);
@@ -514,7 +529,7 @@ void render_main_menu() {
         {"Fingerprint", fp, color::kMuted},
         {"Rede", g_network_choice == Network::kTestnet ? "testnet" : "mainnet",
          g_network_choice == Network::kTestnet ? color::kError : color::kMuted},
-        {"Script", "P2WPKH m/84'", color::kMuted},
+        {"Script", "SegWit m/84'", color::kMuted},
         {"Exportar xpub", ">", color::kMuted},
         {"Endereco de recebimento", ">", color::kMuted},
     };
@@ -552,10 +567,14 @@ void render_psbt_review_output() {
   if (g_output_text.claimed_change_invalid) {
     ui_text(label_x, 18, "ALEGA TROCO: NAO BATE!", color::kError, Font::kBody);
   } else if (g_output_text.is_change) {
+    // /1/i e troco; /0/i e um endereco de recebimento desta seed.
+    const char *fmt = g_output_text.change_chain == kChangeExternal
+                          ? (g_output_text.change_index_high ? "RECEB. #%lu ALTO!"
+                                                             : "PROPRIO receb. #%lu")
+                          : (g_output_text.change_index_high ? "TROCO #%lu ALTO!"
+                                                             : "TROCO #%lu verif.");
     char label[28];
-    snprintf(label, sizeof(label),
-             g_output_text.change_index_high ? "TROCO #%lu ALTO!" : "TROCO #%lu verif.",
-             static_cast<unsigned long>(g_output_text.change_index));
+    snprintf(label, sizeof(label), fmt, static_cast<unsigned long>(g_output_text.change_index));
     ui_text(label_x, 18, label, g_output_text.change_index_high ? color::kError : color::kOk,
             Font::kBody);
   } else {
@@ -578,16 +597,30 @@ void render_psbt_review_output() {
 
 void render_psbt_review_fee() {
   ui_begin_screen("RESUMO", "ESC cancelar", "OK continuar");
-  char n[8];
-  snprintf(n, sizeof(n), "%d", g_summary.num_inputs);
-  kv_line(19, "Entradas", n);
-  snprintf(n, sizeof(n), "%d", g_summary.num_outputs);
-  kv_line(37, "Saidas", n);
+  char n[16];
+  snprintf(n, sizeof(n), "%d / %d", g_summary.num_inputs, g_summary.num_outputs);
+  kv_line(18, "Entradas / Saidas", n);
   uint16_t fee_color = g_fee_text.high_fee_warning ? color::kError : color::kText;
-  kv_line(55, "Taxa", g_fee_text.fee_sats, fee_color);
-  kv_line(73, "Taxa estimada", g_fee_text.fee_rate, fee_color);
+  kv_line(34, "Taxa", g_fee_text.fee_sats, fee_color);
+  kv_line(50, "Taxa estimada", g_fee_text.fee_rate, fee_color);
+  // Externos + taxa: troco e enderecos proprios nao contam.
+  // 8 px/char: com valor >= 100 BTC o rotulo longo nao cabe ao lado.
+  kv_line(66, strlen(g_fee_text.spend_total) > 14 ? "Total" : "Total enviado",
+          g_fee_text.spend_total, color::kOrange);
   if (g_fee_text.high_fee_warning) {
-    ui_text(kScreenW / 2, 96, "AVISO: taxa alta!", color::kError, Font::kTitle, Align::kCenter);
+    ui_text(kScreenW / 2, 92, "AVISO: taxa alta!", color::kError, Font::kTitle, Align::kCenter);
+  }
+}
+
+void render_psbt_review_details() {
+  ui_begin_screen("DETALHES", "ESC cancelar", "OK continuar");
+  kv_line(22, "RBF", g_fee_text.rbf ? "sim (substituivel)" : "nao",
+          g_fee_text.rbf ? color::kOrange : color::kText);
+  kv_line(42, "Locktime", g_fee_text.locktime[0] != '\0' ? g_fee_text.locktime : "nenhum",
+          g_fee_text.locktime[0] != '\0' ? color::kOrange : color::kText);
+  if (g_fee_text.locktime[0] != '\0') {
+    ui_text(kMargin, 66, "So pode ser minerada a partir desse", color::kMuted);
+    ui_text(kMargin, 78, "bloco/horario.", color::kMuted);
   }
 }
 
@@ -669,7 +702,12 @@ void render_receive_address_entry() {
 }
 
 void render_receive_address_show() {
-  uint32_t index = g_index_entry_len > 0 ? static_cast<uint32_t>(atoi(g_index_entry)) : 0;
+  uint32_t index = 0;
+  if (g_index_entry_len > 0 && !parse_receive_index(g_index_entry, &index)) {
+    ui_begin_screen("RECEBER", nullptr, "OK voltar");
+    ui_text(kMargin, 34, "indice invalido (0-999)", color::kError, Font::kBody);
+    return;
+  }
   char title[20];
   snprintf(title, sizeof(title), "RECEBER #%lu", static_cast<unsigned long>(index));
   ui_begin_screen(title, nullptr, "OK voltar");
@@ -679,12 +717,13 @@ void render_receive_address_show() {
   ui_text(kMargin, 20, path, color::kMuted);
 
   char addr[74];
-  if (derive_address(g_session.master_key(), kChangeExternal, index, addr, sizeof(addr))) {
+  // Privado x zpub exportado x decodificacao: so exibe se os tres baterem.
+  if (derive_receive_address_checked(g_session.master_key(), index, addr, sizeof(addr))) {
     char grouped[100];
     format_address_grouped(addr, grouped, sizeof(grouped));
     draw_address(34, grouped);
   } else {
-    ui_text(kMargin, 34, "(falha ao derivar)", color::kError, Font::kBody);
+    ui_text(kMargin, 34, "(falha na verificacao)", color::kError, Font::kBody);
   }
 }
 
@@ -736,6 +775,7 @@ void render() {
   switch (g_state) {
     case State::kSelectWordCount: render_select_word_count(); break;
     case State::kSelectNetwork: render_select_network(); break;
+    case State::kSelectScript: render_select_script(); break;
     case State::kMnemonicEntry: render_mnemonic_entry(); break;
     case State::kChecksumFailed: render_checksum_failed(); break;
     case State::kPassphraseEntry: render_passphrase_entry(); break;
@@ -759,6 +799,7 @@ void render() {
     case State::kMainMenu: render_main_menu(); break;
     case State::kPsbtReviewOutput: render_psbt_review_output(); break;
     case State::kPsbtReviewFee: render_psbt_review_fee(); break;
+    case State::kPsbtReviewDetails: render_psbt_review_details(); break;
     case State::kPsbtConfirm: render_psbt_confirm(); break;
     case State::kPsbtDone: render_psbt_done(); break;
     case State::kError: render_error(); break;
@@ -807,8 +848,8 @@ void finish_mnemonic_entry() {
 }
 
 void attempt_derive_and_show_fingerprint() {
-  if (!derive_master_key(g_mnemonic_text, g_passphrase.value(), g_network_choice,
-                         &g_pending_mk)) {
+  if (!derive_master_key_for(g_script_choice, g_mnemonic_text, g_passphrase.value(),
+                             g_network_choice, &g_pending_mk)) {
     set_status("Falha ao derivar chave");
     return;
   }
@@ -1031,8 +1072,8 @@ void attempt_tool_test_decode() {
 // sessao. Tudo, menos a sessao, e zerado antes do resultado aparecer.
 void verify_against_session() {
   render_busy("CONFERINDO", "Derivando a chave", "comparando com a sessao");
-  bool derived = derive_master_key(g_mnemonic_text, g_passphrase.value(), g_network_choice,
-                                   &g_pending_mk);
+  bool derived = derive_master_key_for(g_script_choice, g_mnemonic_text, g_passphrase.value(),
+                                       g_network_choice, &g_pending_mk);
   bool match = derived && same_account(g_pending_mk, g_session.master_key());
   char fp[10] = {0};
   if (derived) format_fingerprint_spaced(g_pending_mk.master_fingerprint, fp);
@@ -1164,7 +1205,8 @@ void do_xpub_export_download() {
            "Derivation Path: m/84'/%d'/0'\r\n"
            "Extended Public Key: %s\r\n"
            "Receive Descriptor: %s\r\n"
-           "Change Descriptor: %s\r\n",
+           "Change Descriptor: %s\r\n"
+           "Script Type: P2WPKH (SegWit nativo, BIP84)\r\n",
            fp, g_network_choice == Network::kMainnet ? 0 : 1, xpub, receive_desc, change_desc);
   g_xpub_saved = write_text_file(kXpubExportFile, text);
   g_xpub_write_attempted = true;
@@ -1266,14 +1308,24 @@ void handle_key(const KeyEvent &key) {
         g_network_choice = (g_network_choice == Network::kMainnet) ? Network::kTestnet
                                                                    : Network::kMainnet;
       } else if (key.enter) {
+        g_state = State::kSelectScript;
+      } else if (key.esc) {
+        g_restore_mode = false;
+        g_state = State::kSelectWordCount;
+      }
+      break;
+
+    case State::kSelectScript:
+      // So uma opcao selecionavel: ^v nao fazem nada.
+      if (key.enter) {
+        g_script_choice = WalletScript::kP2wpkh;
         if (g_restore_mode) {
           start_restore();
         } else {
           enter_mnemonic_entry();
         }
       } else if (key.esc) {
-        g_restore_mode = false;
-        g_state = State::kSelectWordCount;
+        g_state = State::kSelectNetwork;
       }
       break;
 
@@ -1480,13 +1532,29 @@ void handle_key(const KeyEvent &key) {
         go_to_menu(kTabSign);
         set_status("Cancelado pelo usuario");
       } else if (key.enter) {
+        if (fee_review_has_details(g_fee_text)) {
+          g_state = State::kPsbtReviewDetails;
+        } else {
+          enter_psbt_confirm();
+        }
+      }
+      break;
+
+    case State::kPsbtReviewDetails:
+      if (key.esc) {
+        go_to_menu(kTabSign);
+        set_status("Cancelado pelo usuario");
+      } else if (key.enter) {
         enter_psbt_confirm();
       }
       break;
 
     case State::kPsbtConfirm:
       // Enter e tratado por update_hold() no loop (precisa do estado "segurado").
-      if (key.esc) g_state = State::kPsbtReviewFee;
+      if (key.esc) {
+        g_state = fee_review_has_details(g_fee_text) ? State::kPsbtReviewDetails
+                                                     : State::kPsbtReviewFee;
+      }
       break;
 
     case State::kCardError:
@@ -1524,8 +1592,7 @@ void handle_key(const KeyEvent &key) {
         if (g_index_entry_len > 0) g_index_entry[--g_index_entry_len] = '\0';
       } else if (key.enter) {
         g_state = State::kReceiveAddressShow;
-      } else if (key.ch >= '0' && key.ch <= '9' &&
-                 static_cast<size_t>(g_index_entry_len) + 1 < sizeof(g_index_entry)) {
+      } else if (key.ch >= '0' && key.ch <= '9' && g_index_entry_len < 3) { // 0-999
         g_index_entry[g_index_entry_len++] = key.ch;
         g_index_entry[g_index_entry_len] = '\0';
       }

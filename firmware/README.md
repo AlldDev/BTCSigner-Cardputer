@@ -272,8 +272,20 @@ ASCII (a fonte 6x8 do M5GFX não tem acentos).
   bater com *Account Extended Public Key*. "Baixar arquivo" grava também os output descriptors
   BIP380 (`wpkh([fp/84h/0h/0h]xpub/0/*)#checksum` e `/1/*`), importáveis direto no Sparrow/Core.
 - **TESTNET** aparece em vermelho no header de toda tela depois que a rede foi escolhida.
-- **Revisão**: cada saída é mostrada uma a uma com o endereço COMPLETO, depois o resumo de taxa e,
-  por fim, **segurar Enter por `kHoldToSignMs` (1,5 s)** para assinar. Soltar antes zera a barra, e
+- **Tipo de carteira (tela SCRIPT)**: depois da rede e antes da seed (ou da senha do cartão), como
+  no Electrum, porque o tipo de script define a derivação. Só "SegWit nativo" (BIP84, `m/84'`) é
+  selecionável; "Taproot (em breve)" aparece em cinza e o cursor não para nela. A escolha passa por
+  `derive_master_key_for()` (`keys.h`), que recusa qualquer tipo que não seja P2WPKH.
+- **Endereço de recebimento** (CARTEIRA): índice de 0 a 999 (`kMaxReceiveIndex`, no máximo 3
+  dígitos). O endereço vem de `derive_receive_address_checked()`, que o calcula pela chave privada
+  e de novo a partir do zpub exportado (derivação pública, como a watch-only faz), e decodifica o
+  bech32 de volta. Só aparece se tudo bater; senão, "(falha na verificacao)". O endereço #0 da tela
+  de fingerprint usa a mesma função.
+- **Revisão**: cada saída é mostrada uma a uma com o endereço COMPLETO. Uma saída desta seed em
+  `/1/i` é "TROCO #i"; em `/0/i` é "PROPRIO receb. #i". Depois vem o RESUMO (entradas/saídas,
+  taxa, sat/vB estimado por tipo de script de cada saída e o total enviado = saídas externas +
+  taxa). Se a tx sinaliza RBF (alguma `nSequence < 0xfffffffe`) ou tem `nLockTime`, aparece a tela
+  DETALHES. Por fim, **segurar Enter por `kHoldToSignMs` (1,5 s)** para assinar. Soltar antes zera a barra, e
   o Enter vindo da tela anterior não conta: é preciso soltar e segurar de novo.
 - **Sessão** expira após `kSessionTimeoutMs` (3 min) sem uso, apagando a chave da RAM.
 
@@ -348,7 +360,9 @@ Vetores e casos cobertos:
   máximo `2147483647'` e derivação não-hardened), de `bip-0032.mediawiki`.
 - **BIP84**: vetor oficial de `bip-0084.mediawiki` (zpub da conta + endereços de recebimento/troco),
   exercitando a pilha completa deste firmware (mnemonic → seed → conta → zpub/endereços), não só o
-  trezor-crypto cru.
+  trezor-crypto cru. O endereço de recebimento verificado é conferido contra vetores gerados à parte
+  com o `embit` (Python; mainnet e testnet, índices 0, 1 e 999). Os dois caminhos (privado e pelo
+  zpub) também são comparados em toda a faixa 0..999.
 - **PSBT**: uma PSBT válida construída à mão (input nosso + output externo + troco verdadeiro) —
   valida, calcula taxa/aviso, assina, e a assinatura é conferida com `ecdsa_verify_digest` contra um
   sighash BIP143 recalculado de forma independente do código de produção (pegou um bug real: um

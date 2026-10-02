@@ -3,6 +3,7 @@ firmware/lib/trezor-firmware/.git/
 *.o
 *.a
 .claude
+.roadmap.local
 # Prerequisites
 *.d
 

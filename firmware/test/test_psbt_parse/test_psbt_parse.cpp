@@ -159,11 +159,13 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
                int64_t sighash_value = -1, bool corrupt_change_hash = false,
                bool use_real_fp = true, uint64_t external_value = 50000,
                uint32_t input_coin = kCoinTypeMainnet, uint32_t change_index = 0,
-               PrevTx prev_mode = PrevTx::kNormal) {
+               PrevTx prev_mode = PrevTx::kNormal, uint32_t sequence = 0xffffffff,
+               uint32_t locktime = 0, uint32_t change_chain = kChangeInternal,
+               const uint8_t *external_script = nullptr, size_t external_script_len = 0) {
   uint32_t fingerprint = use_real_fp ? f.mk.master_fingerprint : bip32_fp;
   uint8_t change_pubkey[33];
   uint8_t change_hash[20];
-  derive_hash_and_pubkey(f.mk, kChangeInternal, change_index, change_pubkey, change_hash);
+  derive_hash_and_pubkey(f.mk, change_chain, change_index, change_pubkey, change_hash);
 
   // --- tx anterior (gasta pelo input 0, vout 0) ---
   Builder prev;
@@ -180,16 +182,21 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
   tx.bytes(txid, sizeof(txid));
   tx.u32le(0);       // vout
   tx.varint(0);      // scriptSig vazio
-  tx.u32le(0xffffffff); // sequence
+  tx.u32le(sequence);
   tx.varint(2); // 2 outputs
   // output 0: externo
   tx.u64le(external_value);
-  tx.varint(22);
-  tx.u8(0x00);
-  tx.u8(0x14);
-  uint8_t external_hash[20];
-  memset(external_hash, 0xaa, sizeof(external_hash));
-  tx.bytes(external_hash, sizeof(external_hash));
+  if (external_script != nullptr) {
+    tx.varint(external_script_len);
+    tx.bytes(external_script, external_script_len);
+  } else {
+    tx.varint(22);
+    tx.u8(0x00);
+    tx.u8(0x14);
+    uint8_t external_hash[20];
+    memset(external_hash, 0xaa, sizeof(external_hash));
+    tx.bytes(external_hash, sizeof(external_hash));
+  }
   // output 1: troco
   tx.u64le(49000);
   tx.varint(22);
@@ -202,7 +209,7 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
   } else {
     tx.bytes(change_hash, sizeof(change_hash));
   }
-  tx.u32le(0); // locktime
+  tx.u32le(locktime);
 
   // --- magic + global map ---
   b->bytes((const uint8_t[]){0x70, 0x73, 0x62, 0x74, 0xff}, 5);
@@ -261,7 +268,7 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
   b->u32le(kPurposeBip84);
   b->u32le(kCoinTypeMainnet);
   b->u32le(kAccountHardened);
-  b->u32le(kChangeInternal);
+  b->u32le(change_chain);
   b->u32le(change_index);
   b->end_map();
 }
@@ -529,6 +536,100 @@ static PsbtError validate_built(const Fixture &f, const Builder &b, PsbtSummary 
   return psbt.validate(f.mk, Network::kMainnet, summary);
 }
 
+// --- campos informativos da revisao (RBF, locktime, cadeia, tipo) ----------
+
+static void test_summary_rbf_locktime_and_totals(void) {
+  Fixture f = make_fixture();
+  static PsbtSummary summary;
+
+  Builder plain;
+  build_psbt(f, &plain);
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(validate_built(f, plain, &summary)));
+  TEST_ASSERT_FALSE(summary.rbf);
+  TEST_ASSERT_EQUAL_UINT32(0, summary.locktime);
+  // externo 50000 + taxa 1000; o troco nao entra no total enviado.
+  TEST_ASSERT_EQUAL_UINT64(50000, summary.external_sats);
+  TEST_ASSERT_EQUAL_UINT64(51000, summary.spend_total_sats);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(OutputScriptType::kP2WPKH),
+                        static_cast<int>(summary.outputs[0].script_type));
+  TEST_ASSERT_EQUAL_UINT32(kChangeInternal, summary.outputs[1].change_chain);
+
+  Builder rbf;
+  build_psbt(f, &rbf, 0, -1, false, true, 50000, kCoinTypeMainnet, 0, PrevTx::kNormal,
+             /*sequence=*/0xfffffffd, /*locktime=*/850000);
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(validate_built(f, rbf, &summary)));
+  TEST_ASSERT_TRUE(summary.rbf);
+  TEST_ASSERT_EQUAL_UINT32(850000, summary.locktime);
+
+  // 0xfffffffe: locktime ativo, mas sem sinalizar RBF (BIP125).
+  Builder final_seq;
+  build_psbt(f, &final_seq, 0, -1, false, true, 50000, kCoinTypeMainnet, 0, PrevTx::kNormal,
+             0xfffffffe, 1735689600);
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(validate_built(f, final_seq, &summary)));
+  TEST_ASSERT_FALSE(summary.rbf);
+  TEST_ASSERT_EQUAL_UINT32(1735689600, summary.locktime);
+}
+
+// Output para um endereco de RECEBIMENTO desta seed (/0/5): e nosso, mas a
+// tela tem que mostrar que nao e troco (change_chain == 0).
+static void test_own_receive_address_output_has_chain_zero(void) {
+  Fixture f = make_fixture();
+  static PsbtSummary summary;
+  Builder b;
+  build_psbt(f, &b, 0, -1, false, true, 50000, kCoinTypeMainnet, /*change_index=*/5,
+             PrevTx::kNormal, 0xffffffff, 0, /*change_chain=*/kChangeExternal);
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(validate_built(f, b, &summary)));
+  TEST_ASSERT_TRUE(summary.outputs[1].is_change);
+  TEST_ASSERT_EQUAL_UINT32(0, summary.outputs[1].change_chain);
+  TEST_ASSERT_EQUAL_UINT32(5, summary.outputs[1].change_index);
+  TEST_ASSERT_EQUAL_UINT64(51000, summary.spend_total_sats);
+
+  Builder c;
+  build_psbt(f, &c, 0, -1, false, true, 50000, kCoinTypeMainnet, /*change_index=*/2,
+             PrevTx::kNormal, 0xffffffff, 0, kChangeInternal);
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(validate_built(f, c, &summary)));
+  TEST_ASSERT_TRUE(summary.outputs[1].is_change);
+  TEST_ASSERT_EQUAL_UINT32(1, summary.outputs[1].change_chain);
+  TEST_ASSERT_EQUAL_UINT32(2, summary.outputs[1].change_index);
+}
+
+static void test_output_script_types(void) {
+  Fixture f = make_fixture();
+  static PsbtSummary summary;
+  uint8_t p2wsh[34] = {0x00, 0x20};
+  uint8_t p2tr[34] = {0x51, 0x20};
+  uint8_t p2pkh[25] = {0x76, 0xa9, 0x14};
+  p2pkh[23] = 0x88;
+  p2pkh[24] = 0xac;
+  uint8_t p2sh[23] = {0xa9, 0x14};
+  p2sh[22] = 0x87;
+  memset(p2wsh + 2, 0x11, 32);
+  memset(p2tr + 2, 0x22, 32);
+  memset(p2pkh + 3, 0x33, 20);
+  memset(p2sh + 2, 0x44, 20);
+  struct Case {
+    const uint8_t *script;
+    size_t len;
+    OutputScriptType type;
+  };
+  const Case cases[] = {
+      {p2wsh, sizeof(p2wsh), OutputScriptType::kP2WSH},
+      {p2tr, sizeof(p2tr), OutputScriptType::kP2TR},
+      {p2pkh, sizeof(p2pkh), OutputScriptType::kP2PKH},
+      {p2sh, sizeof(p2sh), OutputScriptType::kP2SH},
+  };
+  for (const Case &c : cases) {
+    Builder b;
+    build_psbt(f, &b, 0, -1, false, true, 50000, kCoinTypeMainnet, 0, PrevTx::kNormal,
+               0xffffffff, 0, kChangeInternal, c.script, c.len);
+    TEST_ASSERT_EQUAL_INT(0, static_cast<int>(validate_built(f, b, &summary)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(c.type),
+                          static_cast<int>(summary.outputs[0].script_type));
+    TEST_ASSERT_FALSE(summary.outputs[0].is_change);
+    TEST_ASSERT_EQUAL_UINT64(50000, summary.external_sats);
+  }
+}
+
 static void test_value_above_max_money_is_rejected(void) {
   Fixture f = make_fixture();
   Builder b;
@@ -703,6 +804,9 @@ int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
   UNITY_BEGIN();
+  RUN_TEST(test_summary_rbf_locktime_and_totals);
+  RUN_TEST(test_own_receive_address_output_has_chain_zero);
+  RUN_TEST(test_output_script_types);
   RUN_TEST(test_valid_psbt_validates_and_summarizes);
   RUN_TEST(test_sign_and_serialize_roundtrip);
   RUN_TEST(test_wrong_fingerprint_is_rejected);

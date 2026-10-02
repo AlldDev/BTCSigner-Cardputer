@@ -237,6 +237,11 @@ bool is_p2wpkh(const uint8_t *script, size_t len, const uint8_t **hash20) {
   return true;
 }
 
+uint32_t read_le32(const uint8_t *p) {
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+         (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+
 // Versoes de endereco legado (base58check) por rede — usadas so para exibir
 // outputs externos P2PKH/P2SH na tela de revisao, nunca para os nossos
 // proprios enderecos (que sao sempre P2WPKH/BIP84).
@@ -692,16 +697,20 @@ void Psbt::fill_output_info(int index, const MasterKey &mk, Network network,
   bool addr_ok = false;
   const uint8_t *hash20 = nullptr;
   if (is_p2wpkh(script, spk.length, &hash20)) {
+    info->script_type = OutputScriptType::kP2WPKH;
     addr_ok = segwit_addr_encode(info->address, hrp, 0, hash20, 20) == 1;
   } else if (spk.length == 34 && script[0] == 0x00 && script[1] == 0x20) {
     // P2WSH: bech32 v0, 32 bytes. So exibido (nao pode ser nosso troco).
+    info->script_type = OutputScriptType::kP2WSH;
     addr_ok = segwit_addr_encode(info->address, hrp, 0, script + 2, 32) == 1;
   } else if (spk.length == 34 && script[0] == 0x51 && script[1] == 0x20) {
     // P2TR: bech32m v1, 32 bytes. Fora do escopo de carteira, so exibicao.
+    info->script_type = OutputScriptType::kP2TR;
     addr_ok = segwit_addr_encode(info->address, hrp, 1, script + 2, 32) == 1;
   } else if (spk.length == 25 && script[0] == 0x76 && script[1] == 0xa9 &&
             script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac) {
     // P2PKH classico
+    info->script_type = OutputScriptType::kP2PKH;
     uint8_t payload[21];
     payload[0] = legacy.p2pkh;
     memcpy(payload + 1, script + 3, 20);
@@ -711,6 +720,7 @@ void Psbt::fill_output_info(int index, const MasterKey &mk, Network network,
   } else if (spk.length == 23 && script[0] == 0xa9 && script[1] == 0x14 &&
             script[22] == 0x87) {
     // P2SH classico
+    info->script_type = OutputScriptType::kP2SH;
     uint8_t payload[21];
     payload[0] = legacy.p2sh;
     memcpy(payload + 1, script + 2, 20);
@@ -742,6 +752,7 @@ void Psbt::fill_output_info(int index, const MasterKey &mk, Network network,
     }
     if (matched) {
       info->is_change = true;
+      info->change_chain = om.change;
       info->change_index = om.index;
       info->change_index_high = om.index > kChangeIndexWarning;
     } else {
@@ -803,6 +814,17 @@ PsbtError Psbt::validate(const MasterKey &mk, Network network,
       static_cast<double>(out_summary->fee_sats) >
           (kHighFeeWarningPercent / 100.0) * static_cast<double>(external_out);
   out_summary->high_fee_warning = over_absolute || over_percent;
+
+  // So informativo para a revisao (DETALHES / "Total enviado"): nenhuma
+  // decisao de validacao depende destes campos.
+  out_summary->external_sats = external_out;
+  out_summary->spend_total_sats = external_out + out_summary->fee_sats;
+  out_summary->locktime = read_le32(buf_ + locktime_span_.offset);
+  for (int i = 0; i < tx_input_count_; i++) {
+    if (read_le32(buf_ + tx_inputs_[i].sequence.offset) < 0xfffffffeu) {
+      out_summary->rbf = true;
+    }
+  }
 
   validated_ = true;
   return PsbtError::kNone;
