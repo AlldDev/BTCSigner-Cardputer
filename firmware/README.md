@@ -113,7 +113,8 @@ tem a E/S de fato (Arduino `SD.h`/`SPI.h`) e só compila no ambiente `cardputer`
 - **Nomes de arquivo**: só letras, dígitos, `-`, `_`, `.` e espaço; `..`, barras ou qualquer coisa
   fora desse conjunto é rejeitada (path traversal). Ao listar, arquivos fora do padrão são omitidos
   do menu.
-- **Layout no cartão**: PSBTs em `/psbt/*.psbt` (até 32 listadas), assinadas gravadas como
+- **Layout no cartão**: PSBTs em `/psbt/*.psbt`, ou na raiz se `/psbt` não existir (até 32
+  listadas; a escolha é refeita a cada montagem), assinadas gravadas como
   `<nome>_signed.psbt`, export em `/wallet_export.txt`.
 - **Troca a quente**: dá para inserir, tirar ou trocar o microSD com o aparelho ligado. Ao entrar na
   lista ASSINAR (e antes de exportar o xpub), o firmware desmonta e monta o cartão de novo
