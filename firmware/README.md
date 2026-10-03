@@ -99,7 +99,8 @@ desconhecidos). Decisões de escopo:
   espaço/tab/CR/LF nas duas pontas são cortados (editores acrescentam `\n`); espaço no meio continua
   inválido (base64 em várias linhas não é suportado). O binário nunca é cortado.
 - **Limites** (`config.h`): 32 KB por arquivo, 20 inputs, 20 outputs. Avisos de taxa alta acima de
-  5% do valor enviado ou 100.000 sats, e de índice de troco acima de 1000.
+  5% do valor enviado ou 100.000 sats, de taxa estimada abaixo do mínimo de relay (0,1 sat/vB, padrão do
+  Bitcoin Core; só aviso, a tx não propagaria) e de índice de troco acima de 1000.
 - Instâncias de `Psbt` têm dezenas de KB de buffers internos e devem ser **estáticas/globais, nunca
   alocadas na stack** (stacks de task do ESP32 têm 8–16 KB).
 

@@ -54,11 +54,12 @@ void build_output_review(const OutputInfo &output, OutputReviewText *out);
 // Texto pronto para exibir do resumo de taxa da transacao inteira.
 struct FeeReviewText {
   char fee_sats[24] = {0};
-  char fee_rate[32] = {0}; // "~X.X sat/vB", vazio se num_inputs/outputs == 0
+  char fee_rate[32] = {0}; // "~X.X sat/vB" ("~0.XX" abaixo de 1), vazio se num_inputs/outputs == 0
   char spend_total[24] = {0}; // "0.01260000 BTC": externos + taxa
   char locktime[32] = {0};    // "bloco 850000" / "unix 1735689600"; vazio se 0
   bool rbf = false;
   bool high_fee_warning = false;
+  bool low_fee_warning = false; // taxa estimada < kMinRelayFeeRateSatPerVb
 };
 
 // A tela DETALHES (RBF/locktime) so aparece quando ha algo a mostrar.

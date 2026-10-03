@@ -84,6 +84,12 @@ constexpr uint32_t kChangeIndexWarning = 1000;
 constexpr double kHighFeeWarningPercent = 5.0; // % do valor enviado
 constexpr uint64_t kHighFeeWarningAbsoluteSats = 100000; // 0.001 BTC, ajustavel
 
+// --- Aviso de taxa baixa ---
+// Minimo de relay padrao do Bitcoin Core (>= 29.1): abaixo disso os nos nao
+// propagam a tx ("min relay fee not met"). So aviso, nunca bloqueia: a taxa
+// e escolha do coordenador. Comparado com a taxa ESTIMADA (estimate_vbytes).
+constexpr double kMinRelayFeeRateSatPerVb = 0.1;
+
 // --- Diretorios/arquivos no microSD ---
 constexpr const char *kPsbtDir = "/psbt";
 constexpr const char *kPsbtExtension = ".psbt";

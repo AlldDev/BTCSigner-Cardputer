@@ -600,7 +600,9 @@ void render_psbt_review_fee() {
   char n[16];
   snprintf(n, sizeof(n), "%d / %d", g_summary.num_inputs, g_summary.num_outputs);
   kv_line(18, "Entradas / Saidas", n);
-  uint16_t fee_color = g_fee_text.high_fee_warning ? color::kError : color::kText;
+  uint16_t fee_color = g_fee_text.high_fee_warning ? color::kError
+                       : g_fee_text.low_fee_warning ? color::kOrange
+                                                    : color::kText;
   kv_line(34, "Taxa", g_fee_text.fee_sats, fee_color);
   kv_line(50, "Taxa estimada", g_fee_text.fee_rate, fee_color);
   // Externos + taxa: troco e enderecos proprios nao contam.
@@ -609,6 +611,9 @@ void render_psbt_review_fee() {
           g_fee_text.spend_total, color::kOrange);
   if (g_fee_text.high_fee_warning) {
     ui_text(kScreenW / 2, 92, "AVISO: taxa alta!", color::kError, Font::kTitle, Align::kCenter);
+  } else if (g_fee_text.low_fee_warning) {
+    ui_text(kScreenW / 2, 92, "AVISO: taxa abaixo do minimo", color::kOrange, Font::kBody,
+            Align::kCenter);
   }
 }
 
