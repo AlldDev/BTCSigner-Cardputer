@@ -166,7 +166,7 @@ papel ou cartão, apagar o backup RFID, brilho) e **SESSAO** (encerrar a sessão
   cartão MIFARE Classic, com a M5Stack Unit RFID2. A passphrase nunca vai para o cartão. O cartão
   deve ser tratado como público: a segurança depende só da força da senha. O cartão guarda duas
   cópias, e uma gravação interrompida não perde o backup. Na área TOOLS dá para conferir o backup
-  (papel ou cartão, com a passphrase) contra a sessão aberta e apagar o backup do cartão. Nada disso acontece se você não pedir. Detalhes e modelo de ameaça em [`firmware/README.md`](./firmware/README.md#backup-opcional-no-cartão-rfid).
+  (papel ou cartão, com a passphrase) contra a sessão aberta e apagar o backup do cartão. Nada disso acontece se você não pedir. Detalhes em [`firmware/README.md`](./firmware/README.md#backup-opcional-no-cartão-rfid).
 - **Criptografia auditada, não caseira**: toda a parte de curva elíptica, hash e derivação vem do
   `trezor-crypto`, a mesma biblioteca das carteiras Trezor.
 - **Fail-closed**: o que não pode ser verificado não é assinado.
@@ -174,7 +174,7 @@ papel ou cartão, apagar o backup RFID, brilho) e **SESSAO** (encerrar a sessão
   o aparelho ligado e a seed carregada), não há câmera/QR, e a segurança da seed depende de como
   ela foi gerada fora do aparelho.
 
-Os detalhes técnicos (validações do parser de PSBT, modelo de ameaça, vendoring, build, testes)
+O build, a instalação e o funcionamento do firmware
 estão em **[`firmware/README.md`](./firmware/README.md)**.
 
 ---

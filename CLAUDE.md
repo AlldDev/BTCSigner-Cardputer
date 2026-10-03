@@ -12,15 +12,15 @@ MIFARE Classic card via the M5Stack Unit RFID2 (WS1850S, I2C 0x28 on Grove G2/G1
 `firmware/README.md` "Backup opcional no cartão RFID".
 Scope is deliberately narrow: BIP84 native SegWit (P2WPKH) only, single-sig, SIGHASH_ALL only, PSBT v0.
 
-`firmware/README.md` (in Portuguese, next to this file) holds the detailed technical docs — read it
-for module status, threat model, and rationale. The root `README.md` is only the user-facing overview.
-**Note:** `spec.md` is referenced throughout the README as "the spec" but is currently deleted in the
-working tree (`git status` shows `D spec.md`) — check working-tree state before assuming it exists.
+`firmware/README.md` (in Portuguese, next to this file) is deliberately lean: build, flashing, basic
+operation and a one-line-per-file map. Keep it that way — no test docs, status tables, threat model
+or "what's missing" lists there; the rationale lives in this file and in code comments. The root
+`README.md` is the user-facing overview.
 
 **Project status**: crypto core and PSBT parser are fully tested on host against official test
-vectors and adversarial inputs. The UI/screen flow and SD I/O have been validated on a physical
-Cardputer on testnet, but it has **never been used on mainnet**. Do not treat this as ready for real
-funds.
+vectors and adversarial inputs. The UI/screen flow, SD I/O, RFID backup and panic hooks have been
+validated on a physical Cardputer on testnet, but it has **never been used on mainnet**. Do not treat
+this as ready for real funds.
 
 ## Build
 
