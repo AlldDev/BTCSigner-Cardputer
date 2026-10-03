@@ -56,6 +56,9 @@ foi validado no aparelho** com a Unit RFID2.
 | Primitivas de tela/teclado | `src/ui.{h,cpp}` | feito, validado no aparelho |
 | Máquina de estados / loop principal | `src/main.cpp` | feito, validado no aparelho (testnet) |
 | Hooks de plataforma do trezor-crypto | `src/trezor_platform.cpp` | feito |
+| Wipe de emergência (falha/panic) | `src/emergency_wipe.{h,cpp}` | feito, testado |
+| Scrub de stack | `src/secure_wipe.{h,cpp}` | feito, testado no host |
+| Panic/core dump do ESP-IDF | `src/panic_hooks.{h,cpp}` | feito, pendente validação no aparelho |
 | Vendoring do trezor-crypto | `lib/trezor_crypto/`, `lib/trezor-firmware/` (submódulo) | feito |
 
 `session.h` não tem `.cpp`: a lógica inteira (timeout + wipe) cabe em métodos inline.
@@ -200,7 +203,8 @@ aes_key/mac_key = HMAC-SHA256(master, "BTCSigner-RFID-v1-enc" / "...-mac")
 - **Wipe.** Chaves, contextos AES (a lib não os zera), texto plano e bits BIP39 ficam num único
   buffer estático, zerado em todo retorno. Em seguida um `scrub_stack()` sobrescreve 1,5 KB de
   stack, onde `aes_*_key256`, `aescrypt` e `sha256_Transform` do código vendorizado deixam round
-  keys e estado sem zerar. O `mnemonic_clear()` é chamado logo após
+  keys e estado sem zerar (além do scrub da stack livre no fim de todo `loop()`, veja
+  "Modelo de ameaça"). O `mnemonic_clear()` é chamado logo após
   `mnemonic_from_data()`, que escreve num buffer estático da lib. As senhas ficam em
   `PassphraseInput`. Tudo entra em `wipe_seed_material()`.
 - **Senha.** Mínimo de 12 caracteres, pelo menos 8 caracteres distintos, não pode ser só dígitos
@@ -358,8 +362,8 @@ pio test -e native -f test_review_screens    # uma suíte, pelo nome do diretór
 Cada diretório em `test/` é um binário Unity independente rodando no host: `test_bip32_vectors`,
 `test_bip39_vectors`, `test_bip84_vectors`, `test_mnemonic_input`, `test_passphrase_input`,
 `test_psbt_parse`, `test_review_screens`, `test_rfid_seed_card`, `test_rfid_integration`,
-`test_sd_io_paths`, `test_session`. `ui.cpp`, `main.cpp`, `sd_io.cpp` e `rfid_io.cpp` dependem de
-hardware e ficam de fora do `native`.
+`test_sd_io_paths`, `test_secure_wipe`, `test_session`. `ui.cpp`, `main.cpp`, `sd_io.cpp`,
+`rfid_io.cpp` e `panic_hooks.cpp` dependem de hardware e ficam de fora do `native`.
 
 Vetores e casos cobertos:
 
@@ -472,9 +476,29 @@ onde há um bug conhecido. Daí o parser próprio, mínimo e com testes dedicado
 - **Sem secure element**: nenhuma proteção contra ataques físicos avançados (glitching, power
   analysis, dump de RAM com o aparelho ligado e a seed carregada). Mitigado só pela posse física
   durante a sessão e pelo timeout de inatividade.
+- **JTAG continua ligado.** O USB-Serial-JTAG do ESP32-S3 vem habilitado de fábrica. Com o
+  aparelho ligado e a sessão aberta, quem tiver acesso ao USB consegue parar a CPU e ler a RAM.
+  Desligar isso exige queimar eFuse (irreversível) e não está feito.
 - **Sem câmera**: não há QR code; toda entrada/saída passa pelo microSD.
 - **A segurança da seed depende da geração externa**: o firmware só valida o checksum BIP39, não
   como a seed foi gerada.
+
+### Falhas, panic e resíduo de stack
+
+- **Core dump desligado.** O `sdkconfig` pré-compilado do arduino-esp32 grava um core dump na
+  partição `coredump` da flash (0x7F0000) em todo panic. O dump leva as stacks das tasks, que podem
+  ter resto de seed e de chave, e ficaria persistido e legível com `esptool read_flash`. O link usa
+  `-Wl,--wrap=esp_core_dump_to_flash` para que nada seja gravado. Além disso, o `setup()` apaga
+  qualquer dump deixado por uma versão antiga ou por outra tabela de partições (M5Launcher).
+- **Panic silencioso no release.** O `-Wl,--wrap=esp_panic_handler` troca o handler do ESP-IDF por
+  wipe dos segredos + reset, sem imprimir registradores nem backtrace na UART0/USB. O
+  `cardputer-debug` mantém a saída do panic para desenvolver, mas sem core dump.
+- **Falha detectada pelo trezor-crypto** (`tc_fault_handler`, ex.: `consteq` anômalo): zera os
+  segredos (`emergency_wipe()`) e chama `esp_restart()`, sem passar pelo panic.
+- **Stack.** O SHA-2/HMAC/PBKDF2, o AES e o RFC6979 do trezor-crypto deixam estado secreto na stack
+  sem zerar. No fim de todo `loop()`, `scrub_free_stack()` sobrescreve toda a stack livre da
+  `loopTask`, preservando o canário e a watchpoint de fim de stack do FreeRTOS. O resíduo dura no
+  máximo uma iteração do loop.
 
 ### Geração da seed fora do aparelho
 
@@ -518,8 +542,9 @@ perde:
 - **O cartão não substitui o backup em papel.** Cartões falham, e mudar
   `kRfidPbkdf2Iterations` ou o formato invalida os backups gravados. Qualquer pessoa com o cartão na
   mão pode apagá-lo.
-- **Resíduo de stack.** Funções internas do SHA-256 do trezor-crypto podem deixar resíduo na stack
-  durante o KDF, a mesma limitação que o caminho BIP39 já aceita (sem secure element, veja acima).
+- **Resíduo de stack.** O estado que o SHA-256/AES do trezor-crypto deixa na stack durante o KDF é
+  sobrescrito ao fim da operação e de novo no fim do `loop()` (veja "Falhas, panic e resíduo de
+  stack").
 
 ---
 

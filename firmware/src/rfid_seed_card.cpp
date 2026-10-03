@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "secure_wipe.h"
 #include "strong_random.h"
 
 extern "C" {
@@ -66,13 +67,6 @@ void derive_keys(const char *password, size_t password_len, const uint8_t *salt,
   hmac_sha256(g_scratch.master, kKeyLen, reinterpret_cast<const uint8_t *>(kLabelMac),
               sizeof(kLabelMac) - 1, g_scratch.mac_key);
   memzero(g_scratch.master, sizeof(g_scratch.master));
-}
-
-// aes_*_key256, aescrypt e sha256_Transform deixam round keys/estado na stack
-// sem zerar (vendorizado, nao editavel). Sobrescreve essa regiao ao sair.
-__attribute__((noinline)) void scrub_stack() {
-  uint8_t pad[1536];
-  memzero(pad, sizeof(pad));
 }
 
 size_t entropy_len_for_words(int words) { return static_cast<size_t>(words) * 4 / 3; }

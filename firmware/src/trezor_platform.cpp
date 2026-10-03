@@ -4,8 +4,9 @@
 //
 //  - tc_fault_handler(): chamado por consteq() quando uma comparacao em
 //    tempo constante detecta uma anomalia (possivel fault injection). A
-//    reacao correta e parar a execucao imediatamente, sem imprimir nada que
-//    possa vazar estado.
+//    reacao correta e zerar os segredos e reiniciar imediatamente, sem
+//    imprimir nada que possa vazar estado. No aparelho nao usa abort(): ele
+//    passaria pelo panic do ESP-IDF (dump na serial, core dump).
 //  - random_buffer(): fonte de entropia usada pelo trezor-crypto para
 //    mascaramento contra side-channel durante a assinatura ECDSA (RFC6979 ja
 //    torna o nonce deterministico; isso e so blinding adicional). NAO e a
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include "emergency_wipe.h"
 #include "strong_random.h"
 
 #if defined(ARDUINO) || defined(ESP_PLATFORM)
@@ -29,7 +31,12 @@ extern "C" {
 
 void tc_fault_handler(const char *msg) {
   (void)msg; // nunca logar: pode ser dado sensivel no momento da falha
+  btcseed::emergency_wipe();
+#if defined(ARDUINO) || defined(ESP_PLATFORM)
+  esp_restart();
+#else
   abort();
+#endif
 }
 
 void random_buffer(uint8_t *buf, size_t len) {
