@@ -36,8 +36,8 @@ Three environments in `platformio.ini`:
 - `cardputer` — real hardware, `board = m5stack-stamps3` (ESP32-S3), release build, Serial/USB-CDC
   disabled.
 - `cardputer-debug` — same, but `-DCORE_DEBUG_LEVEL=3` and Serial on, for development.
-- `native` — host-only, excludes `main.cpp`/`ui.cpp`/`sd_io.cpp`/`rfid_io.cpp` (the
-  hardware-dependent files) and `lib_ignore`s `MFRC522_I2C`, used exclusively to run tests.
+- `native` — host-only, excludes `main.cpp`/`ui.cpp`/`sd_io.cpp`/`rfid_io.cpp`/`panic_hooks.cpp`
+  (the hardware-dependent files) and `lib_ignore`s `MFRC522_I2C`, used exclusively to run tests.
 
 To flash via M5Launcher (which only accepts a merged image, not the bare `firmware.bin`):
 
@@ -67,8 +67,9 @@ pio test -e native -f test_review_screens        # one suite, by test/ directory
 Suites live under `firmware/test/`, one Unity binary per directory: `test_bip32_vectors`,
 `test_bip39_vectors`, `test_bip84_vectors`, `test_mnemonic_input`, `test_passphrase_input`,
 `test_psbt_parse`, `test_review_screens`, `test_rfid_seed_card`, `test_rfid_integration`,
-`test_sd_io_paths`, `test_session`. `main.cpp`, `ui.cpp`, `sd_io.cpp` and `rfid_io.cpp` have no host
-tests — they're hardware-only and excluded from `native`. The golden vectors in
+`test_sd_io_paths`, `test_secure_wipe`, `test_session`. `main.cpp`, `ui.cpp`, `sd_io.cpp`,
+`rfid_io.cpp` and `panic_hooks.cpp` have no host tests — they're hardware-only and excluded from
+`native`. The golden vectors in
 `test_rfid_seed_card` come from an independent Python implementation (hashlib + cryptography); if the
 card format changes, regenerate them the same way rather than copying the firmware's own output.
 
@@ -161,6 +162,16 @@ libsecp256k1 (Bitcoin Core's library) is **not** used; trezor-crypto's own `secp
   written; auth tries `kMifareKeys` in order.
 - Never call the `PICC_Dump*`/`PCD_DumpVersionToSerial` functions of `MFRC522_I2C`, and don't add
   `Serial`/`ESP_LOG` output to `rfid_*` files.
+- Panic/fault must never leak or persist secrets. The precompiled `sdkconfig` writes a core dump to
+  flash and prints the panic on UART0/USB; `platformio.ini` counters it with
+  `-Wl,--wrap=esp_core_dump_to_flash` (both device envs) and `-Wl,--wrap=esp_panic_handler`
+  (release only), implemented in `src/panic_hooks.cpp`, plus `erase_stale_core_dump()` at the start
+  of `setup()`. `tc_fault_handler` does `emergency_wipe()` + `esp_restart()` on device. The
+  `emergency_wipe` callback runs in panic context: memzero only, no I2C/SPI, drawing or logging.
+  Verify the wraps took effect with `objdump` (calls go to `__wrap_*`), not just that it builds.
+- `loop()` ends with `scrub_free_stack()` (`secure_wipe.h`), which overwrites the loopTask's whole
+  free stack with 0xA5 while sparing the FreeRTOS canary/end-of-stack watchpoint. Keep early returns
+  inside `loop_once()` so the scrub always runs.
 - PSBT validation is fail-closed by design: anything the parser can't fully verify (unrecognized
   script, unverifiable change claim, mismatched derivation) must be rejected or flagged, not
   silently accepted.

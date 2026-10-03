@@ -16,14 +16,17 @@
 #include <cstring>
 
 #include "config.h"
+#include "emergency_wipe.h"
 #include "keys.h"
 #include "mnemonic_input.h"
+#include "panic_hooks.h"
 #include "passphrase_input.h"
 #include "psbt.h"
 #include "review_screens.h"
 #include "rfid_io.h"
 #include "rfid_seed_card.h"
 #include "sd_io.h"
+#include "secure_wipe.h"
 #include "session.h"
 #include "ui.h"
 
@@ -234,6 +237,13 @@ void wipe_seed_material() {
   memzero(g_rfid_scan, sizeof(g_rfid_scan));
   rfid_wipe_scratch();
   mnemonic_clear(); // buffer estatico de mnemonic_from_data() (bip39.c)
+}
+
+// Callback de emergency_wipe(): roda em contexto de falha/panic, entao so
+// memzero. Nada de rfid_release_card() (I2C), desenho ou log.
+void wipe_all_secrets_for_fault() {
+  wipe_seed_material();
+  g_session.end();
 }
 
 void go_to_start(const char *reason) {
@@ -1649,6 +1659,8 @@ void handle_key(const KeyEvent &key) {
 } // namespace
 
 void setup() {
+  erase_stale_core_dump();
+  set_emergency_wipe(wipe_all_secrets_for_fault);
   ui_init();
   ui_clear();
   ui_logo(kScreenW / 2, 36);
@@ -1667,7 +1679,9 @@ void setup() {
   render();
 }
 
-void loop() {
+// Corpo do loop(). Separado para que loop() limpe a stack depois de qualquer
+// retorno.
+static void loop_once() {
   ui_update();
 
   // Antes da sessao existir o mnemonico (e depois g_pending_mk) ja esta na
@@ -1714,4 +1728,11 @@ void loop() {
   g_session.touch();
   handle_key(key);
   render();
+}
+
+void loop() {
+  loop_once();
+  // Derivacao, checksum BIP39, assinatura e backup RFID passam por codigo
+  // vendorizado que deixa estado secreto na stack. Limpa tudo abaixo daqui.
+  scrub_free_stack();
 }
