@@ -142,6 +142,52 @@ bool read_value(Cursor *c, ByteSpan *value) {
   return c->read_bytes(static_cast<size_t>(valuelen), value);
 }
 
+// BIP174: toda chave (keytype + keydata) e unica dentro do mapa, inclusive as
+// desconhecidas — que voltam verbatim no PSBT assinado. Em vez de guardar as
+// chaves ja vistas, rele os pares de `map_start` ate `key_pos` (onde comeca a
+// chave atual): O(n^2), mas zero RAM e sem limite de chaves por mapa. Esses
+// pares ja foram lidos com sucesso; se a releitura falhar mesmo assim, trata
+// como duplicada (fail-closed).
+bool is_duplicate_key(const uint8_t *buf, size_t map_start, size_t key_pos,
+                      uint8_t keytype, ByteSpan keydata) {
+  Cursor c(buf, key_pos, map_start);
+  while (c.pos() < key_pos) {
+    bool is_sep = false;
+    uint8_t t = 0;
+    ByteSpan d{};
+    ByteSpan v{};
+    if (!read_key(&c, &is_sep, &t, &d) || is_sep || !read_value(&c, &v)) return true;
+    if (t == keytype && d.length == keydata.length &&
+        memcmp(buf + d.offset, buf + keydata.offset, d.length) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Corta, so num arquivo de texto, um BOM UTF-8 no comeco (Bloco de Notas do
+// Windows) e espaco/tab/CR/LF nas duas pontas (editor que acrescenta '\n').
+// So ajusta ponteiro e tamanho. Espaco no meio continua invalido para o
+// base64_decode — base64 quebrado em linhas nao e suportado de proposito.
+void trim_text(const uint8_t **data, size_t *len) {
+  const uint8_t *p = *data;
+  size_t n = *len;
+  if (n >= 3 && p[0] == 0xef && p[1] == 0xbb && p[2] == 0xbf) {
+    p += 3;
+    n -= 3;
+  }
+  auto is_space = [](uint8_t ch) {
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+  };
+  while (n > 0 && is_space(p[0])) {
+    p++;
+    n--;
+  }
+  while (n > 0 && is_space(p[n - 1])) n--;
+  *data = p;
+  *len = n;
+}
+
 // --- base64 (nao e criptografia — apenas codificacao de texto) -------------
 
 int8_t b64_val(uint8_t c) {
@@ -260,7 +306,14 @@ PsbtError Psbt::load(const uint8_t *data, size_t len) {
   if (data == nullptr || len == 0) return PsbtError::kEmptyFile;
   if (len > kMaxPsbtFileSize) return PsbtError::kFileTooLarge;
 
-  if (len >= 5 && memcmp(data, kPsbtMagic, 5) == 0) {
+  // O binario nunca e cortado: 0x0a/0x20 no fim podem ser dado legitimo.
+  bool is_binary = len >= 5 && memcmp(data, kPsbtMagic, 5) == 0;
+  if (!is_binary) {
+    trim_text(&data, &len);
+    if (len == 0) return PsbtError::kEmptyFile;
+  }
+
+  if (is_binary) {
     is_base64_ = false;
     memcpy(buf_, data, len);
     buf_len_ = len;
@@ -295,10 +348,14 @@ PsbtError Psbt::parse_structure() {
     bool is_sep = false;
     uint8_t keytype = 0;
     ByteSpan keydata{};
+    size_t key_pos = c.pos();
     if (!read_key(&c, &is_sep, &keytype, &keydata)) return PsbtError::kTruncated;
     if (is_sep) break;
     ByteSpan value{};
     if (!read_value(&c, &value)) return PsbtError::kTruncated;
+    if (is_duplicate_key(buf_, global_start, key_pos, keytype, keydata)) {
+      return PsbtError::kDuplicateField;
+    }
 
     if (keytype == 0x00) { // PSBT_GLOBAL_UNSIGNED_TX
       if (seen_tx) return PsbtError::kDuplicateField;
@@ -337,6 +394,9 @@ PsbtError Psbt::parse_structure() {
     err = parse_output_map(i, &pos);
     if (err != PsbtError::kNone) return err;
   }
+  // Bytes depois do ultimo mapa: nao seriam assinados nem exibidos, mas
+  // outra ferramenta poderia le-los (ex.: dois PSBTs colados). Fail-closed.
+  if (pos != buf_len_) return PsbtError::kMalformed;
 
   return PsbtError::kNone;
 }
@@ -399,10 +459,14 @@ PsbtError Psbt::parse_input_map(int index, size_t *cursor_pos) {
     bool is_sep = false;
     uint8_t keytype = 0;
     ByteSpan keydata{};
+    size_t key_pos = c.pos();
     if (!read_key(&c, &is_sep, &keytype, &keydata)) return PsbtError::kTruncated;
     if (is_sep) break;
     ByteSpan value{};
     if (!read_value(&c, &value)) return PsbtError::kTruncated;
+    if (is_duplicate_key(buf_, start, key_pos, keytype, keydata)) {
+      return PsbtError::kDuplicateField;
+    }
 
     switch (keytype) {
       case 0x00: // PSBT_IN_NON_WITNESS_UTXO — conferido em verify_prev_tx()
@@ -503,10 +567,14 @@ PsbtError Psbt::parse_output_map(int index, size_t *cursor_pos) {
     bool is_sep = false;
     uint8_t keytype = 0;
     ByteSpan keydata{};
+    size_t key_pos = c.pos();
     if (!read_key(&c, &is_sep, &keytype, &keydata)) return PsbtError::kTruncated;
     if (is_sep) break;
     ByteSpan value{};
     if (!read_value(&c, &value)) return PsbtError::kTruncated;
+    if (is_duplicate_key(buf_, start, key_pos, keytype, keydata)) {
+      return PsbtError::kDuplicateField;
+    }
 
     if (keytype == 0x02) { // PSBT_OUT_BIP32_DERIVATION
       if (m.has_bip32_derivation) return PsbtError::kDuplicateField;

@@ -104,7 +104,11 @@ void build_fee_review(const PsbtSummary &summary, FeeReviewText *out) {
   if (summary.num_inputs > 0 || summary.num_outputs > 0) {
     double vbytes = estimate_vbytes(summary);
     double rate = vbytes > 0 ? static_cast<double>(summary.fee_sats) / vbytes : 0.0;
-    snprintf(out->fee_rate, sizeof(out->fee_rate), "~%.1f sat/vB", rate);
+    // Abaixo de 1 sat/vB, 1 casa arredondaria 0.07 para "0.1" e esconderia
+    // uma taxa abaixo do minimo de relay.
+    snprintf(out->fee_rate, sizeof(out->fee_rate),
+             rate < 1.0 ? "~%.2f sat/vB" : "~%.1f sat/vB", rate);
+    out->low_fee_warning = rate < kMinRelayFeeRateSatPerVb;
   }
   format_btc(summary.spend_total_sats, out->spend_total, sizeof(out->spend_total));
   // Consenso: nLockTime < 500000000 e altura de bloco; acima, timestamp unix.

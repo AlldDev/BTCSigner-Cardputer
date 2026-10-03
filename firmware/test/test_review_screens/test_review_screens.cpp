@@ -235,6 +235,39 @@ static void test_build_fee_review_propagates_high_fee_warning(void) {
   TEST_ASSERT_TRUE(text.high_fee_warning);
 }
 
+// Caso real da testnet: 10 sats para 1 input / 2 outputs P2WPKH (~0.07
+// sat/vB) foi recusado pelo no ("min relay fee not met, 10 < 15"), mas a
+// tela mostrava "~0.1 sat/vB".
+static void test_build_fee_review_low_fee(void) {
+  PsbtSummary summary{};
+  summary.num_inputs = 1;
+  summary.num_outputs = 2;
+  summary.fee_sats = 10;
+
+  FeeReviewText text;
+  build_fee_review(summary, &text);
+  // 10 / 140.5 = 0.0711...
+  TEST_ASSERT_EQUAL_STRING("~0.07 sat/vB", text.fee_rate);
+  TEST_ASSERT_TRUE(text.low_fee_warning);
+  TEST_ASSERT_FALSE(text.high_fee_warning);
+
+  // Fronteira de 0.1 sat/vB: 14 / 140.5 = 0.0996 (aviso), 15 / 140.5 = 0.1068 (ok).
+  summary.fee_sats = 14;
+  build_fee_review(summary, &text);
+  TEST_ASSERT_EQUAL_STRING("~0.10 sat/vB", text.fee_rate);
+  TEST_ASSERT_TRUE(text.low_fee_warning);
+  summary.fee_sats = 15;
+  build_fee_review(summary, &text);
+  TEST_ASSERT_EQUAL_STRING("~0.11 sat/vB", text.fee_rate);
+  TEST_ASSERT_FALSE(text.low_fee_warning);
+
+  // A partir de 1 sat/vB volta a 1 casa: 141 / 140.5 = 1.0035.
+  summary.fee_sats = 141;
+  build_fee_review(summary, &text);
+  TEST_ASSERT_EQUAL_STRING("~1.0 sat/vB", text.fee_rate);
+  TEST_ASSERT_FALSE(text.low_fee_warning);
+}
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
@@ -254,5 +287,6 @@ int main(int argc, char **argv) {
   RUN_TEST(test_build_output_review_propagates_change_index);
   RUN_TEST(test_build_fee_review);
   RUN_TEST(test_build_fee_review_propagates_high_fee_warning);
+  RUN_TEST(test_build_fee_review_low_fee);
   return UNITY_END();
 }

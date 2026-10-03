@@ -91,8 +91,16 @@ desconhecidos). Decisões de escopo:
 - **"Rede compatível"**: uma scriptPubKey não carrega nenhum byte de rede (isso é só convenção da
   STRING de endereço) — não há o que cruzar a partir da PSBT. O firmware sempre formata endereços
   usando a rede da sessão; ver o comentário em `psbt.cpp::validate()`.
+- **Estrutura estrita**: toda chave (keytype + keydata) tem que ser única dentro do seu mapa,
+  inclusive as desconhecidas/proprietárias, que voltam verbatim na saída (`kDuplicateField`); a
+  checagem relê o mapa em vez de guardar as chaves (zero RAM, sem teto de chaves). Bytes depois do
+  último mapa de output rejeitam o arquivo (`kMalformed`), inclusive um `\n` no fim de um binário.
+- **Base64 tolerante só nas pontas**: num arquivo de texto, um BOM UTF-8 no começo e
+  espaço/tab/CR/LF nas duas pontas são cortados (editores acrescentam `\n`); espaço no meio continua
+  inválido (base64 em várias linhas não é suportado). O binário nunca é cortado.
 - **Limites** (`config.h`): 32 KB por arquivo, 20 inputs, 20 outputs. Avisos de taxa alta acima de
-  5% do valor enviado ou 100.000 sats, e de índice de troco acima de 1000.
+  5% do valor enviado ou 100.000 sats, de taxa estimada abaixo do mínimo de relay (0,1 sat/vB, padrão do
+  Bitcoin Core; só aviso, a tx não propagaria) e de índice de troco acima de 1000.
 - Instâncias de `Psbt` têm dezenas de KB de buffers internos e devem ser **estáticas/globais, nunca
   alocadas na stack** (stacks de task do ESP32 têm 8–16 KB).
 
@@ -369,7 +377,9 @@ Vetores e casos cobertos:
   sighash BIP143 recalculado de forma independente do código de produção (pegou um bug real: um
   array de scriptCode com um elemento a menos, que deslocava `OP_EQUALVERIFY`/`OP_CHECKSIG`). Casos
   maliciosos/malformados: fingerprint errado, sighash ≠ ALL, troco falsificado, arquivo truncado,
-  magic corrompido, scriptSig não-vazio na unsigned tx, round-trip binário/base64, entre outros.
+  magic corrompido, scriptSig não-vazio na unsigned tx, round-trip binário/base64, bytes sobrando
+  no fim, chave duplicada (inclusive desconhecida) nos três tipos de mapa, base64 com BOM/espaço
+  nas pontas, entre outros.
 - **Backup RFID**: vetores fixos gerados por uma implementação independente (Python: `hashlib` +
   `cryptography`) com RNG de contador, das duas cópias, com 1000 iterações e com as de produção,
   tanto para codificar quanto para decodificar; uma cópia danificada cai para a outra; as cópias não

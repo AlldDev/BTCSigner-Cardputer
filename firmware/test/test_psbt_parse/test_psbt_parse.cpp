@@ -146,6 +146,14 @@ void build_prev_tx(const uint8_t recv_hash[20], uint64_t amount, bool segwit,
   raw->u32le(0);
 }
 
+// Pares chave/valor brutos acrescentados no fim de cada mapa (antes do
+// separador), para os testes de chave duplicada/desconhecida.
+struct ExtraPairs {
+  const Builder *global = nullptr;
+  const Builder *input = nullptr;
+  const Builder *output = nullptr; // output 1 (troco)
+};
+
 // Constroi um PSBT binario com 1 input (nosso, witness_utxo=100000 sats) e
 // 2 outputs: externo (50000 sats, hash arbitrario) e troco de verdade
 // (49000 sats, m/84'/0'/0'/1/0) — fee = 1000 sats.
@@ -161,7 +169,8 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
                uint32_t input_coin = kCoinTypeMainnet, uint32_t change_index = 0,
                PrevTx prev_mode = PrevTx::kNormal, uint32_t sequence = 0xffffffff,
                uint32_t locktime = 0, uint32_t change_chain = kChangeInternal,
-               const uint8_t *external_script = nullptr, size_t external_script_len = 0) {
+               const uint8_t *external_script = nullptr, size_t external_script_len = 0,
+               const ExtraPairs *extra = nullptr) {
   uint32_t fingerprint = use_real_fp ? f.mk.master_fingerprint : bip32_fp;
   uint8_t change_pubkey[33];
   uint8_t change_hash[20];
@@ -217,6 +226,9 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
   b->u8(0x00); // PSBT_GLOBAL_UNSIGNED_TX
   b->varint(tx.size());
   b->bytes(tx.data(), tx.size());
+  if (extra != nullptr && extra->global != nullptr) {
+    b->bytes(extra->global->data(), extra->global->size());
+  }
   b->end_map();
 
   // --- input map (1 input) ---
@@ -254,6 +266,9 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
     b->varint(4);
     b->u32le(static_cast<uint32_t>(sighash_value));
   }
+  if (extra != nullptr && extra->input != nullptr) {
+    b->bytes(extra->input->data(), extra->input->size());
+  }
   b->end_map();
 
   // --- output maps ---
@@ -270,7 +285,24 @@ void build_psbt(const Fixture &f, Builder *b, uint32_t bip32_fp = 0,
   b->u32le(kAccountHardened);
   b->u32le(change_chain);
   b->u32le(change_index);
+  if (extra != nullptr && extra->output != nullptr) {
+    b->bytes(extra->output->data(), extra->output->size());
+  }
   b->end_map();
+}
+
+// Par PSBT_*_PROPRIETARY (0xfc) com 1 byte de keydata e 1 byte de valor.
+void proprietary_pair(Builder *b, uint8_t keydata, uint8_t value) {
+  b->varint(2);
+  b->u8(0xfc);
+  b->u8(keydata);
+  b->varint(1);
+  b->u8(value);
+}
+
+void build_psbt_with_extra(const Fixture &f, const ExtraPairs &extra, Builder *b) {
+  build_psbt(f, b, 0, -1, false, true, 50000, kCoinTypeMainnet, 0, PrevTx::kNormal,
+             0xffffffff, 0, kChangeInternal, nullptr, 0, &extra);
 }
 
 // Recalcula, de forma totalmente independente de psbt.cpp, o sighash BIP143
@@ -800,6 +832,193 @@ static void test_nonempty_scriptsig_is_rejected(void) {
                        static_cast<int>(err));
 }
 
+// --- bytes sobrando, chaves duplicadas, base64 com espacos nas pontas -------
+
+static void test_trailing_bytes_are_rejected(void) {
+  Fixture f = make_fixture();
+  Builder b;
+  build_psbt(f, &b);
+  static Psbt psbt;
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(psbt.load(b.data(), b.size())));
+
+  b.u8(0x00);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kMalformed),
+                        static_cast<int>(psbt.load(b.data(), b.size())));
+
+  // O binario nunca e cortado: um '\n' no fim tambem e byte sobrando.
+  Builder nl;
+  build_psbt(f, &nl);
+  nl.u8('\n');
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kMalformed),
+                        static_cast<int>(psbt.load(nl.data(), nl.size())));
+
+  // Mesmo lixo vindo dentro do base64.
+  uint8_t b64[8192];
+  size_t b64_len = 0;
+  test_base64_encode(b.data(), b.size(), b64, &b64_len);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kMalformed),
+                        static_cast<int>(psbt.load(b64, b64_len)));
+}
+
+static void test_duplicate_unknown_key_is_rejected(void) {
+  Fixture f = make_fixture();
+  Builder dup;
+  proprietary_pair(&dup, 0x01, 0xaa);
+  proprietary_pair(&dup, 0x01, 0xbb); // mesma chave, valor diferente
+
+  ExtraPairs in_global;
+  in_global.global = &dup;
+  ExtraPairs in_input;
+  in_input.input = &dup;
+  ExtraPairs in_output;
+  in_output.output = &dup;
+  const ExtraPairs *cases[] = {&in_global, &in_input, &in_output};
+
+  static Psbt psbt;
+  for (const ExtraPairs *extra : cases) {
+    Builder b;
+    build_psbt_with_extra(f, *extra, &b);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kDuplicateField),
+                          static_cast<int>(psbt.load(b.data(), b.size())));
+  }
+}
+
+static void test_duplicate_key_not_adjacent_is_rejected(void) {
+  Fixture f = make_fixture();
+  Builder dup;
+  proprietary_pair(&dup, 0x01, 0xaa);
+  proprietary_pair(&dup, 0x02, 0xaa);
+  proprietary_pair(&dup, 0x01, 0xaa);
+  ExtraPairs extra;
+  extra.input = &dup;
+  Builder b;
+  build_psbt_with_extra(f, extra, &b);
+  static Psbt psbt;
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kDuplicateField),
+                        static_cast<int>(psbt.load(b.data(), b.size())));
+}
+
+// Mesmo keytype com keydata diferente e chave nova; e o mesmo keydata sob
+// outro keytype tambem. Nada disso e duplicata.
+static void test_same_keytype_with_other_keydata_is_accepted(void) {
+  Fixture f = make_fixture();
+  Builder pairs;
+  proprietary_pair(&pairs, 0x01, 0xaa);
+  proprietary_pair(&pairs, 0x02, 0xaa);
+  pairs.varint(2);
+  pairs.u8(0xfd); // keytype desconhecido, mesmo keydata 0x01
+  pairs.u8(0x01);
+  pairs.varint(0);
+  ExtraPairs extra;
+  extra.global = &pairs;
+  extra.input = &pairs;
+  extra.output = &pairs;
+  Builder b;
+  build_psbt_with_extra(f, extra, &b);
+  static PsbtSummary summary;
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(validate_built(f, b, &summary)));
+}
+
+// Sem teto de chaves por mapa: a checagem rele o buffer em vez de guardar
+// as chaves vistas.
+static void test_map_with_many_distinct_keys_is_accepted(void) {
+  Fixture f = make_fixture();
+  Builder pairs;
+  for (int i = 0; i < 300; i++) {
+    pairs.varint(3);
+    pairs.u8(0xfc);
+    pairs.u8(static_cast<uint8_t>(i >> 8));
+    pairs.u8(static_cast<uint8_t>(i));
+    pairs.varint(0);
+  }
+  ExtraPairs extra;
+  extra.input = &pairs;
+  Builder b;
+  build_psbt_with_extra(f, extra, &b);
+  static PsbtSummary summary;
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(validate_built(f, b, &summary)));
+}
+
+static size_t base64_of_fixture(const Fixture &f, const char *prefix, const char *suffix,
+                                uint8_t *out) {
+  Builder b;
+  build_psbt(f, &b);
+  size_t n = strlen(prefix);
+  memcpy(out, prefix, n);
+  size_t enc_len = 0;
+  test_base64_encode(b.data(), b.size(), out + n, &enc_len);
+  n += enc_len;
+  memcpy(out + n, suffix, strlen(suffix));
+  return n + strlen(suffix);
+}
+
+static void test_base64_with_whitespace_at_ends_is_accepted(void) {
+  Fixture f = make_fixture();
+  struct Case {
+    const char *prefix;
+    const char *suffix;
+  };
+  const Case cases[] = {
+      {"", "\n"},          {"", "\r\n"},     {"", "  \n"},
+      {"\n", ""},          {" \t\r\n", "\t \r\n\n"},
+      {"\xef\xbb\xbf", ""}, {"\xef\xbb\xbf", "\r\n"},
+  };
+  static uint8_t text[8192];
+  static Psbt psbt;
+  for (const Case &c : cases) {
+    size_t len = base64_of_fixture(f, c.prefix, c.suffix, text);
+    TEST_ASSERT_EQUAL_INT(0, static_cast<int>(psbt.load(text, len)));
+    TEST_ASSERT_TRUE(psbt.is_base64());
+    PsbtSummary summary;
+    TEST_ASSERT_EQUAL_INT(
+        0, static_cast<int>(psbt.validate(f.mk, Network::kMainnet, &summary)));
+  }
+}
+
+static void test_base64_with_whitespace_in_middle_is_rejected(void) {
+  Fixture f = make_fixture();
+  static uint8_t text[8192];
+  size_t len = base64_of_fixture(f, "", "", text);
+  // Quebra a linha no meio (como base64 em linhas de 64/76 colunas).
+  memmove(text + 65, text + 64, len - 64);
+  text[64] = '\n';
+  static Psbt psbt;
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kBadEncoding),
+                        static_cast<int>(psbt.load(text, len + 1)));
+
+  // BOM so e aceito no comeco; espaco/BOM sozinhos sao arquivo vazio.
+  const uint8_t only_space[] = {0xef, 0xbb, 0xbf, ' ', '\r', '\n'};
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kEmptyFile),
+                        static_cast<int>(psbt.load(only_space, sizeof(only_space))));
+}
+
+// base64 com '\n' no fim -> assinado -> a saida e base64 limpo, sem espaco,
+// e volta a passar pela estrutura (para so em kAlreadyHasSignature).
+static void test_trimmed_base64_signs_to_clean_base64(void) {
+  Fixture f = make_fixture();
+  static uint8_t text[8192];
+  size_t len = base64_of_fixture(f, "", "\r\n", text);
+  static Psbt psbt;
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(psbt.load(text, len)));
+  PsbtSummary summary;
+  TEST_ASSERT_EQUAL_INT(0,
+                        static_cast<int>(psbt.validate(f.mk, Network::kMainnet, &summary)));
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(psbt.sign(f.mk)));
+
+  static uint8_t out[8192];
+  size_t out_len = 0;
+  TEST_ASSERT_TRUE(psbt.serialize_signed(out, sizeof(out), &out_len));
+  TEST_ASSERT_EQUAL_INT(0, memcmp(out, "cHNidP", 6));
+  TEST_ASSERT_EQUAL_UINT32(0, out_len % 4);
+  for (size_t i = 0; i < out_len; i++) {
+    TEST_ASSERT_TRUE(test_b64_val(out[i]) >= 0 || out[i] == '=');
+  }
+
+  static Psbt again;
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PsbtError::kAlreadyHasSignature),
+                        static_cast<int>(again.load(out, out_len)));
+}
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
@@ -824,5 +1043,13 @@ int main(int argc, char **argv) {
   RUN_TEST(test_bad_magic_is_rejected);
   RUN_TEST(test_base64_roundtrip_matches_binary);
   RUN_TEST(test_nonempty_scriptsig_is_rejected);
+  RUN_TEST(test_trailing_bytes_are_rejected);
+  RUN_TEST(test_duplicate_unknown_key_is_rejected);
+  RUN_TEST(test_duplicate_key_not_adjacent_is_rejected);
+  RUN_TEST(test_same_keytype_with_other_keydata_is_accepted);
+  RUN_TEST(test_map_with_many_distinct_keys_is_accepted);
+  RUN_TEST(test_base64_with_whitespace_at_ends_is_accepted);
+  RUN_TEST(test_base64_with_whitespace_in_middle_is_rejected);
+  RUN_TEST(test_trimmed_base64_signs_to_clean_base64);
   return UNITY_END();
 }

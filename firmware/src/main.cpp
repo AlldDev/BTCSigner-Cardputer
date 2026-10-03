@@ -600,15 +600,24 @@ void render_psbt_review_fee() {
   char n[16];
   snprintf(n, sizeof(n), "%d / %d", g_summary.num_inputs, g_summary.num_outputs);
   kv_line(18, "Entradas / Saidas", n);
-  uint16_t fee_color = g_fee_text.high_fee_warning ? color::kError : color::kText;
-  kv_line(34, "Taxa", g_fee_text.fee_sats, fee_color);
-  kv_line(50, "Taxa estimada", g_fee_text.fee_rate, fee_color);
+  uint16_t fee_color = g_fee_text.high_fee_warning ? color::kError
+                       : g_fee_text.low_fee_warning ? color::kOrange
+                                                    : color::kText;
+  // A taxa vem do PSBT (inputs - outputs), definida pelo coordenador. O
+  // sat/vB divide pelo tamanho estimado; o aparelho nao conhece a mempool.
+  kv_line(34, "Taxa total", g_fee_text.fee_sats, fee_color);
+  kv_line(50, strlen(g_fee_text.fee_rate) > 14 ? "Por vbyte" : "Taxa por vbyte",
+          g_fee_text.fee_rate, fee_color);
   // Externos + taxa: troco e enderecos proprios nao contam.
   // 8 px/char: com valor >= 100 BTC o rotulo longo nao cabe ao lado.
   kv_line(66, strlen(g_fee_text.spend_total) > 14 ? "Total" : "Total enviado",
           g_fee_text.spend_total, color::kOrange);
   if (g_fee_text.high_fee_warning) {
     ui_text(kScreenW / 2, 92, "AVISO: taxa alta!", color::kError, Font::kTitle, Align::kCenter);
+  } else if (g_fee_text.low_fee_warning) {
+    char warn[32];
+    snprintf(warn, sizeof(warn), "AVISO: abaixo do min. %.1f/vB", kMinRelayFeeRateSatPerVb);
+    ui_text(kScreenW / 2, 92, warn, color::kOrange, Font::kBody, Align::kCenter);
   }
 }
 
